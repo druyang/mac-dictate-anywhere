@@ -24,6 +24,12 @@ final class ComponentRenderTests: XCTestCase {
     func testHintRenders() { assertRenders(DSHint(text: "Helpful hint text for the user.")) }
     func testPanelRenders() { assertRenders(DSPanel(text: "Informational panel message body.", icon: "keyboard")) }
 
+    func testPanelRendersInEveryTone() {
+        for tone in DS.Tone.allCases {
+            assertRenders(DSPanel(text: "Message body rendered in the \(tone) tone.", tone: tone))
+        }
+    }
+
     func testChipRenders() {
         assertRenders(DSChip(text: "um"))
         assertRenders(DSChip(text: "removable", onRemove: {}))
@@ -32,8 +38,9 @@ final class ComponentRenderTests: XCTestCase {
 
     func testStatusPillRenders() {
         assertRenders(DSStatusPill(text: "Ready"))
+        assertRenders(DSStatusPill(text: "Not downloaded", tone: .neutral))
         assertRenders(DSStatusPill(
-            text: "Not downloaded",
+            text: "Custom colors",
             dotColor: DS.Colors.textSecondary,
             textColor: DS.Colors.textSecondary,
             fill: DS.Colors.bgInset
@@ -139,6 +146,16 @@ final class ComponentRenderTests: XCTestCase {
 
     func testWaveformPillRenders() {
         assertRenders(DSWaveformPill())
+    }
+
+    func testStreamingResponseOverlayRenders() {
+        let model = OverlayModel()
+        model.overlayState = .response(
+            text: "Here is the response as it arrives from the assistant.",
+            isComplete: false
+        )
+        model.isVisible = true
+        assertRenders(OverlayContent(model: model), width: 320)
     }
 
     // MARK: - Organisms

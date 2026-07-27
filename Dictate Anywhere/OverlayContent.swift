@@ -24,7 +24,9 @@ enum OverlayMetrics {
 enum OverlayState: Equatable {
     case listening(level: Float, transcript: String)
     case processing
+    case response(text: String, isComplete: Bool)
     case success
+    case error
     case copiedOnly
 }
 
@@ -70,7 +72,9 @@ struct OverlayContent: View {
         switch state {
         case .listening: "listening"
         case .processing: "processing"
+        case .response: "response"
         case .success: "success"
+        case .error: "error"
         case .copiedOnly: "copiedOnly"
         }
     }
@@ -81,9 +85,9 @@ struct OverlayContent: View {
 
     private var isCircularStatusState: Bool {
         switch state {
-        case .processing, .success:
+        case .processing, .success, .error:
             return true
-        default:
+        case .listening, .response, .copiedOnly:
             return false
         }
     }
@@ -96,7 +100,9 @@ struct OverlayContent: View {
         switch state {
         case .listening:
             return showTextPreview ? OverlayMetrics.size(260) : OverlayMetrics.size(130)
-        case .processing, .success:
+        case .response:
+            return OverlayMetrics.size(260)
+        case .processing, .success, .error:
             return statusCircleDiameter
         case .copiedOnly:
             return OverlayMetrics.size(130)
@@ -107,7 +113,9 @@ struct OverlayContent: View {
         switch state {
         case .listening:
             return showTextPreview ? OverlayMetrics.size(124) : OverlayMetrics.size(44)
-        case .processing, .success:
+        case .response:
+            return OverlayMetrics.size(124)
+        case .processing, .success, .error:
             return statusCircleDiameter
         case .copiedOnly:
             return OverlayMetrics.size(44)
@@ -155,8 +163,16 @@ struct OverlayContent: View {
         case .processing:
             ProcessingStatusView(tint: overlayTextColor)
 
+        case .response(let text, let isComplete):
+            responseContent(text: text, isComplete: isComplete)
+
         case .success:
             SuccessStatusView()
+
+        case .error:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: OverlayMetrics.type(17), weight: .semibold))
+                .foregroundStyle(.orange)
 
         case .copiedOnly:
             HStack(spacing: OverlayMetrics.size(10)) {
@@ -168,6 +184,41 @@ struct OverlayContent: View {
                     .foregroundStyle(overlayTextColor.opacity(0.9))
             }
         }
+    }
+
+    private func responseContent(text: String, isComplete: Bool) -> some View {
+        let previewText = trimmedPreviewText(for: text)
+
+        return VStack(alignment: .leading, spacing: OverlayMetrics.size(6)) {
+            HStack(spacing: OverlayMetrics.size(5)) {
+                if !isComplete {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .scaleEffect(0.7)
+                }
+                Text(isComplete ? "Response" : "Speaking…")
+                    .font(.system(size: OverlayMetrics.type(9), weight: .semibold))
+                    .foregroundStyle(overlayTextColor.opacity(0.72))
+                    .textCase(.uppercase)
+                    .tracking(0.5)
+            }
+
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    Text(previewText)
+                        .font(.system(size: OverlayMetrics.type(13), weight: .regular))
+                        .foregroundStyle(overlayTextColor)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .id("response")
+                }
+                .onChange(of: previewText) { _, _ in
+                    proxy.scrollTo("response", anchor: .bottom)
+                }
+            }
+        }
+        .padding(.horizontal, OverlayMetrics.size(16))
+        .padding(.vertical, OverlayMetrics.size(11))
     }
 
     @ViewBuilder

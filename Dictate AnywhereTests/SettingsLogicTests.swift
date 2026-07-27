@@ -10,6 +10,17 @@ final class SettingsLogicTests: XCTestCase {
     private var savedHistory: [TranscriptHistoryEntry] = []
     private var savedBindings: [HotkeyBinding] = []
     private var savedMode: TranscriptPostProcessingMode = .none
+    private var savedAgentBrain: AgentBrainProvider = .appleIntelligence
+    private var savedAgentSystemPrompt = ""
+    private var savedAgentOpenRouterWebSearchEnabled = false
+    private var savedCodexToolEnabled = false
+    private var savedCodexWorkspacePath = ""
+    private var savedSpeechModel: SpeechSynthesisModel = .supertonic3
+    private var savedSupertonicVoice: SupertonicVoiceChoice = .m1
+    private var savedPocketVoice: PocketVoiceChoice = .alba
+    private var savedSpeechLanguage: SpeechOutputLanguage = .english
+    private var savedOpenRouterSpeechModel = ""
+    private var savedOpenRouterSpeechVoice = ""
 
     override func setUp() {
         super.setUp()
@@ -19,6 +30,17 @@ final class SettingsLogicTests: XCTestCase {
         savedHistory = settings.transcriptHistory
         savedBindings = settings.hotkeyBindings
         savedMode = settings.transcriptPostProcessingMode
+        savedAgentBrain = settings.agentBrainProvider
+        savedAgentSystemPrompt = settings.agentSystemPrompt
+        savedAgentOpenRouterWebSearchEnabled = settings.agentOpenRouterWebSearchEnabled
+        savedCodexToolEnabled = settings.codexToolEnabled
+        savedCodexWorkspacePath = settings.codexWorkspacePath
+        savedSpeechModel = settings.speechSynthesisModel
+        savedSupertonicVoice = settings.supertonicVoice
+        savedPocketVoice = settings.pocketVoice
+        savedSpeechLanguage = settings.speechOutputLanguage
+        savedOpenRouterSpeechModel = settings.openRouterSpeechModel
+        savedOpenRouterSpeechVoice = settings.openRouterSpeechVoice
     }
 
     override func tearDown() {
@@ -28,6 +50,17 @@ final class SettingsLogicTests: XCTestCase {
         settings.transcriptHistory = savedHistory
         settings.hotkeyBindings = savedBindings
         settings.transcriptPostProcessingMode = savedMode
+        settings.agentBrainProvider = savedAgentBrain
+        settings.agentSystemPrompt = savedAgentSystemPrompt
+        settings.agentOpenRouterWebSearchEnabled = savedAgentOpenRouterWebSearchEnabled
+        settings.codexToolEnabled = savedCodexToolEnabled
+        settings.codexWorkspacePath = savedCodexWorkspacePath
+        settings.speechSynthesisModel = savedSpeechModel
+        settings.supertonicVoice = savedSupertonicVoice
+        settings.pocketVoice = savedPocketVoice
+        settings.speechOutputLanguage = savedSpeechLanguage
+        settings.openRouterSpeechModel = savedOpenRouterSpeechModel
+        settings.openRouterSpeechVoice = savedOpenRouterSpeechVoice
         super.tearDown()
     }
 
@@ -175,5 +208,82 @@ final class SettingsLogicTests: XCTestCase {
 
         settings.transcriptPostProcessingMode = .fluidAudioVocabulary
         XCTAssertTrue(settings.fluidAudioVocabularyEnabled)
+    }
+
+    func testAgentBrainCanBeChangedIndependentlyFromTranscriptCleanup() {
+        let settings = Settings.shared
+        settings.transcriptPostProcessingMode = .none
+
+        settings.agentBrainProvider = .ollama
+        XCTAssertEqual(settings.agentBrainProvider, .ollama)
+        XCTAssertEqual(settings.transcriptPostProcessingMode, .none)
+
+        settings.agentBrainProvider = .openRouter
+        XCTAssertEqual(settings.agentBrainProvider, .openRouter)
+        XCTAssertEqual(settings.transcriptPostProcessingMode, .none)
+    }
+
+    func testCodexToolSettingsCanBeChangedIndependentlyFromAssistantBrain() {
+        let settings = Settings.shared
+        settings.agentBrainProvider = .ollama
+        settings.codexToolEnabled = true
+        settings.codexWorkspacePath = "/tmp/example-project"
+
+        XCTAssertTrue(settings.codexToolEnabled)
+        XCTAssertEqual(settings.codexWorkspacePath, "/tmp/example-project")
+        XCTAssertEqual(settings.agentBrainProvider, .ollama)
+    }
+
+    func testVoiceAssistantSystemPromptIsIncludedInAgentConfiguration() {
+        let settings = Settings.shared
+        settings.agentSystemPrompt = "Be direct and practical."
+
+        let configuration = VoiceAgentService.Configuration(settings: settings)
+
+        XCTAssertEqual(configuration.systemPrompt, "Be direct and practical.")
+    }
+
+    func testOpenRouterWebAccessIsIncludedInAgentConfiguration() {
+        let settings = Settings.shared
+        settings.agentOpenRouterWebSearchEnabled = true
+
+        let configuration = VoiceAgentService.Configuration(settings: settings)
+
+        XCTAssertTrue(configuration.openRouterWebSearchEnabled)
+    }
+
+    func testSpeechOutputSettingsCanBeChangedIndependently() {
+        let settings = Settings.shared
+        settings.agentBrainProvider = .appleIntelligence
+        settings.transcriptPostProcessingMode = .none
+
+        settings.speechSynthesisModel = .pocketTTS
+        settings.supertonicVoice = .f3
+        settings.pocketVoice = .javert
+        settings.speechOutputLanguage = .french
+
+        XCTAssertEqual(settings.speechSynthesisModel, .pocketTTS)
+        XCTAssertEqual(settings.supertonicVoice, .f3)
+        XCTAssertEqual(settings.pocketVoice, .javert)
+        XCTAssertEqual(settings.speechOutputLanguage, .french)
+        XCTAssertEqual(settings.agentBrainProvider, .appleIntelligence)
+        XCTAssertEqual(settings.transcriptPostProcessingMode, .none)
+    }
+
+    func testOpenRouterSpeechUsesIndependentModelAndVoiceSettings() {
+        let settings = Settings.shared
+        settings.openRouterSpeechModel = "qwen/qwen-audio-3.0-tts-flash"
+        settings.openRouterSpeechVoice = "loongjohn"
+        settings.speechSynthesisModel = .openRouter
+
+        let configuration = SpeechOutputConfiguration(settings: settings)
+        XCTAssertEqual(configuration.model, .openRouter)
+        XCTAssertEqual(configuration.openRouterModel, "qwen/qwen-audio-3.0-tts-flash")
+        XCTAssertEqual(configuration.openRouterVoice, "loongjohn")
+        XCTAssertEqual(configuration.openRouterAPIKey, settings.openRouterAPIKey)
+        XCTAssertEqual(
+            configuration.openRouterAPIKeyEnvironmentVariable,
+            settings.openRouterAPIKeyEnvironmentVariable
+        )
     }
 }

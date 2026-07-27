@@ -20,7 +20,7 @@ struct ShortcutsView: View {
         DSPage {
             DSSectionHeader(
                 title: "Shortcuts",
-                subtitle: "Start and stop dictation from anywhere with a quick key press."
+                subtitle: "Dictate text or ask the voice assistant from anywhere."
             )
 
             DSSection(overline: "Keyboard Shortcuts") {
@@ -51,6 +51,12 @@ struct ShortcutsView: View {
                         onModeChanged: { newMode in
                             var updated = binding
                             updated.mode = newMode
+                            settings.updateBinding(updated)
+                            appState.hotkeyService.restartMonitoring()
+                        },
+                        onActionChanged: { newAction in
+                            var updated = binding
+                            updated.action = newAction
                             settings.updateBinding(updated)
                             appState.hotkeyService.restartMonitoring()
                         },
@@ -85,6 +91,7 @@ struct ShortcutsView: View {
 
             DSPanel(
                 text: "Press any key combo, or press only modifiers (like \u{2303}\u{2325}\u{2318}) and release. Left and right modifiers are supported — for example, R\u{2318} uses only the right Command key.",
+                tone: .neutral,
                 icon: "keyboard"
             )
         }
@@ -100,21 +107,26 @@ private struct HotkeyBindingRow: View {
     let onRecord: (UInt16?, HotkeyModifiers, String) -> Void
     let onClear: () -> Void
     let onModeChanged: (HotkeyMode) -> Void
+    let onActionChanged: (HotkeyAction) -> Void
     let onDelete: () -> Void
     let onRecordingStarted: () -> Void
     let onRecordingStopped: () -> Void
 
     private var shortcutName: String {
-        switch binding.mode {
-        case .handsFreeToggle: return "Toggle dictation"
-        case .holdToRecord: return "Hold to record"
+        switch (binding.action, binding.mode) {
+        case (.dictate, .handsFreeToggle): return "Toggle dictation"
+        case (.dictate, .holdToRecord): return "Hold to dictate"
+        case (.ask, .handsFreeToggle): return "Toggle voice question"
+        case (.ask, .holdToRecord): return "Hold to ask"
         }
     }
 
     private var shortcutCaption: String {
-        switch binding.mode {
-        case .handsFreeToggle: return "Tap once to start, tap again to stop"
-        case .holdToRecord: return "Hold the keys down while you speak"
+        switch (binding.action, binding.mode) {
+        case (.dictate, .handsFreeToggle): return "Tap once to start, tap again to paste"
+        case (.dictate, .holdToRecord): return "Hold the keys down while you dictate"
+        case (.ask, .handsFreeToggle): return "Tap once to start, tap again to hear the answer"
+        case (.ask, .holdToRecord): return "Hold the keys down while you ask a question"
         }
     }
 
@@ -152,13 +164,26 @@ private struct HotkeyBindingRow: View {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(DS.Colors.accentDeep)
+                        .foregroundStyle(DS.Tone.warning.icon)
                     Text(message)
                         .font(DS.Fonts.ui(12))
-                        .foregroundStyle(DS.Colors.panelText)
+                        .foregroundStyle(DS.Tone.warning.text)
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 10)
+            }
+
+            DSDivider()
+
+            DSInfoRow(label: "Action") {
+                DSDropdown(
+                    selection: Binding(
+                        get: { binding.action },
+                        set: { onActionChanged($0) }
+                    ),
+                    options: HotkeyAction.allCases,
+                    title: \.displayName
+                )
             }
 
             DSDivider()

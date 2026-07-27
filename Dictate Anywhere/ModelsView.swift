@@ -2,7 +2,7 @@
 //  ModelsView.swift
 //  Dictate Anywhere
 //
-//  "Speech Model" page: download, delete, engine selector.
+//  "Dictation Model" page: download, delete, engine selector.
 //
 
 import SwiftUI
@@ -20,7 +20,7 @@ struct ModelsView: View {
 
         DSPage {
             DSSectionHeader(
-                title: "Speech Model",
+                title: "Dictation Model",
                 subtitle: "Everything runs on your Mac — your voice never leaves this device."
             )
 
@@ -195,12 +195,7 @@ struct ModelsView: View {
         } else {
             DSInfoRow(label: "Status") {
                 HStack(spacing: 10) {
-                    DSStatusPill(
-                        text: "Not set up",
-                        dotColor: DS.Colors.textSecondary,
-                        textColor: DS.Colors.textSecondary,
-                        fill: DS.Colors.bgInset
-                    )
+                    DSStatusPill(text: "Not set up", tone: .neutral)
                     Button("Set Up Apple Speech") {
                         Task { await appState.prepareActiveEngine() }
                     }
@@ -228,12 +223,7 @@ struct ModelsView: View {
         } else {
             DSInfoRow(label: "Status") {
                 HStack(spacing: 10) {
-                    DSStatusPill(
-                        text: "Not downloaded",
-                        dotColor: DS.Colors.textSecondary,
-                        textColor: DS.Colors.textSecondary,
-                        fill: DS.Colors.bgInset
-                    )
+                    DSStatusPill(text: "Not downloaded", tone: .neutral)
                     Button("Download Model") {
                         downloadError = nil
                         Task {

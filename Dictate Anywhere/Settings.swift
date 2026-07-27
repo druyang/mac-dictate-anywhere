@@ -255,6 +255,177 @@ enum TranscriptPostProcessingMode: String, CaseIterable {
     }
 }
 
+// MARK: - Voice Assistant
+
+enum AgentBrainProvider: String, CaseIterable, Codable, Sendable {
+    case appleIntelligence = "appleIntelligence"
+    case ollama = "ollama"
+    case openRouter = "openRouter"
+
+    nonisolated var displayName: String {
+        switch self {
+        case .appleIntelligence: return "Apple Intelligence"
+        case .ollama: return "Ollama"
+        case .openRouter: return "OpenRouter"
+        }
+    }
+}
+
+enum SpeechSynthesisModel: String, CaseIterable, Codable, Sendable {
+    case supertonic3
+    case kokoroAne
+    case pocketTTS
+    case openRouter
+
+    nonisolated var displayName: String {
+        switch self {
+        case .supertonic3: return "Supertonic-3"
+        case .kokoroAne: return "KokoroAne 82M"
+        case .pocketTTS: return "PocketTTS"
+        case .openRouter: return "OpenRouter"
+        }
+    }
+
+    nonisolated var detail: String {
+        switch self {
+        case .supertonic3:
+            return "FluidAudio's highest-quality general voice model, with 44.1 kHz output and ten voices."
+        case .kokoroAne:
+            return "A compact, fast 82M model with phoneme-based English pronunciation."
+        case .pocketTTS:
+            return "A streaming-capable model with natural prosody and voice-cloning support."
+        case .openRouter:
+            return "Cloud speech through OpenRouter, with a live catalog of speech models and voices."
+        }
+    }
+
+    nonisolated var languageSummary: String {
+        switch self {
+        case .supertonic3: return "31 languages"
+        case .kokoroAne: return "English"
+        case .pocketTTS: return "English pack"
+        case .openRouter: return "Model-dependent"
+        }
+    }
+
+    nonisolated var sampleRateSummary: String {
+        switch self {
+        case .supertonic3: return "44.1 kHz"
+        case .kokoroAne, .pocketTTS: return "24 kHz"
+        case .openRouter: return "Cloud"
+        }
+    }
+
+    nonisolated var licenseSummary: String {
+        switch self {
+        case .supertonic3: return "OpenRAIL++"
+        case .kokoroAne: return "Apache 2.0"
+        case .pocketTTS: return "CC BY 4.0"
+        case .openRouter: return "Usage-based"
+        }
+    }
+
+    nonisolated var expectedDownloadBytes: Int64 {
+        switch self {
+        case .supertonic3: return 199_390_409
+        case .kokoroAne: return 186_208_560
+        case .pocketTTS: return 454_245_751
+        case .openRouter: return 0
+        }
+    }
+
+    nonisolated var sizeSummary: String {
+        guard expectedDownloadBytes > 0 else { return "No download" }
+        return ByteCountFormatter.string(fromByteCount: expectedDownloadBytes, countStyle: .file)
+    }
+
+    nonisolated var isLocal: Bool {
+        self != .openRouter
+    }
+
+    nonisolated static var localCases: [SpeechSynthesisModel] {
+        allCases.filter(\.isLocal)
+    }
+}
+
+enum SupertonicVoiceChoice: String, CaseIterable, Codable, Sendable {
+    case f1 = "F1"
+    case f2 = "F2"
+    case f3 = "F3"
+    case f4 = "F4"
+    case f5 = "F5"
+    case m1 = "M1"
+    case m2 = "M2"
+    case m3 = "M3"
+    case m4 = "M4"
+    case m5 = "M5"
+
+    nonisolated var displayName: String {
+        switch self {
+        case .f1: return "Female 1"
+        case .f2: return "Female 2"
+        case .f3: return "Female 3"
+        case .f4: return "Female 4"
+        case .f5: return "Female 5"
+        case .m1: return "Male 1"
+        case .m2: return "Male 2"
+        case .m3: return "Male 3"
+        case .m4: return "Male 4"
+        case .m5: return "Male 5"
+        }
+    }
+}
+
+enum PocketVoiceChoice: String, CaseIterable, Codable, Sendable {
+    case alba
+    case azelma
+    case cosette
+    case javert
+
+    nonisolated var displayName: String {
+        rawValue.capitalized
+    }
+}
+
+enum SpeechOutputLanguage: String, CaseIterable, Codable, Sendable {
+    case english = "en"
+    case korean = "ko"
+    case japanese = "ja"
+    case arabic = "ar"
+    case bulgarian = "bg"
+    case czech = "cs"
+    case danish = "da"
+    case german = "de"
+    case greek = "el"
+    case spanish = "es"
+    case estonian = "et"
+    case finnish = "fi"
+    case french = "fr"
+    case hindi = "hi"
+    case croatian = "hr"
+    case hungarian = "hu"
+    case indonesian = "id"
+    case italian = "it"
+    case lithuanian = "lt"
+    case latvian = "lv"
+    case dutch = "nl"
+    case polish = "pl"
+    case portuguese = "pt"
+    case romanian = "ro"
+    case russian = "ru"
+    case slovak = "sk"
+    case slovenian = "sl"
+    case swedish = "sv"
+    case turkish = "tr"
+    case ukrainian = "uk"
+    case vietnamese = "vi"
+
+    nonisolated var displayName: String {
+        Locale.current.localizedString(forLanguageCode: rawValue)?.capitalized
+            ?? rawValue.uppercased()
+    }
+}
+
 enum OllamaReasoningCapability: String, Sendable {
     case unsupported = "unsupported"
     case toggle = "toggle"
@@ -331,6 +502,18 @@ enum HotkeyMode: String, CaseIterable, Codable {
     }
 }
 
+enum HotkeyAction: String, CaseIterable, Codable, Sendable {
+    case dictate = "dictate"
+    case ask = "ask"
+
+    nonisolated var displayName: String {
+        switch self {
+        case .dictate: return "Dictate"
+        case .ask: return "Ask"
+        }
+    }
+}
+
 // MARK: - Hotkey Binding
 
 nonisolated struct HotkeyModifiers: OptionSet, Codable, Equatable {
@@ -366,6 +549,52 @@ struct HotkeyBinding: Codable, Identifiable, Equatable {
     var modifiersRawValue: UInt64
     var displayName: String
     var mode: HotkeyMode
+    var action: HotkeyAction = .dictate
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case keyCode
+        case modifiersRawValue
+        case displayName
+        case mode
+        case action
+    }
+
+    init(
+        id: UUID,
+        keyCode: UInt16?,
+        modifiersRawValue: UInt64,
+        displayName: String,
+        mode: HotkeyMode,
+        action: HotkeyAction = .dictate
+    ) {
+        self.id = id
+        self.keyCode = keyCode
+        self.modifiersRawValue = modifiersRawValue
+        self.displayName = displayName
+        self.mode = mode
+        self.action = action
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        keyCode = try container.decodeIfPresent(UInt16.self, forKey: .keyCode)
+        modifiersRawValue = try container.decode(UInt64.self, forKey: .modifiersRawValue)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        mode = try container.decode(HotkeyMode.self, forKey: .mode)
+        action = try container.decodeIfPresent(HotkeyAction.self, forKey: .action) ?? .dictate
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encodeIfPresent(keyCode, forKey: .keyCode)
+        try container.encode(modifiersRawValue, forKey: .modifiersRawValue)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encode(mode, forKey: .mode)
+        try container.encode(action, forKey: .action)
+    }
 
     nonisolated var modifiers: HotkeyModifiers {
         get { Settings.normalizedHotkeyModifiers(HotkeyModifiers(rawValue: modifiersRawValue)) }
@@ -382,7 +611,8 @@ struct HotkeyBinding: Codable, Identifiable, Equatable {
         keyCode: nil,
         modifiersRawValue: HotkeyModifiers([.control, .option, .command]).rawValue,
         displayName: "\u{2303}\u{2325}\u{2318}",
-        mode: .holdToRecord
+        mode: .holdToRecord,
+        action: .dictate
     )
 }
 
@@ -494,6 +724,17 @@ final class Settings {
         static let customVocabulary = "customVocabulary"
         static let transcriptHistory = "transcriptHistory"
         static let transcriptPostProcessingMode = "transcriptPostProcessingMode"
+        static let agentBrainProvider = "agentBrainProvider"
+        static let agentSystemPrompt = "agentSystemPrompt"
+        static let agentOpenRouterWebSearchEnabled = "agentOpenRouterWebSearchEnabled"
+        static let codexToolEnabled = "codexToolEnabled"
+        static let codexWorkspacePath = "codexWorkspacePath"
+        static let speechSynthesisModel = "speechSynthesisModel"
+        static let supertonicVoice = "supertonicVoice"
+        static let pocketVoice = "pocketVoice"
+        static let speechOutputLanguage = "speechOutputLanguage"
+        static let openRouterSpeechModel = "openRouterSpeechModel"
+        static let openRouterSpeechVoice = "openRouterSpeechVoice"
         static let ollamaBaseURL = "ollamaBaseURL"
         static let ollamaModel = "ollamaModel"
         static let ollamaReasoningSetting = "ollamaReasoningSetting"
@@ -612,6 +853,75 @@ final class Settings {
         didSet {
             guard let data = try? JSONEncoder().encode(transcriptHistory) else { return }
             UserDefaults.standard.set(data, forKey: Keys.transcriptHistory)
+        }
+    }
+
+    var agentBrainProvider: AgentBrainProvider {
+        didSet {
+            UserDefaults.standard.set(agentBrainProvider.rawValue, forKey: Keys.agentBrainProvider)
+        }
+    }
+
+    var agentSystemPrompt: String {
+        didSet {
+            UserDefaults.standard.set(agentSystemPrompt, forKey: Keys.agentSystemPrompt)
+        }
+    }
+
+    var agentOpenRouterWebSearchEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                agentOpenRouterWebSearchEnabled,
+                forKey: Keys.agentOpenRouterWebSearchEnabled
+            )
+        }
+    }
+
+    var codexToolEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(codexToolEnabled, forKey: Keys.codexToolEnabled)
+        }
+    }
+
+    var codexWorkspacePath: String {
+        didSet {
+            UserDefaults.standard.set(codexWorkspacePath, forKey: Keys.codexWorkspacePath)
+        }
+    }
+
+    var speechSynthesisModel: SpeechSynthesisModel {
+        didSet {
+            UserDefaults.standard.set(speechSynthesisModel.rawValue, forKey: Keys.speechSynthesisModel)
+        }
+    }
+
+    var supertonicVoice: SupertonicVoiceChoice {
+        didSet {
+            UserDefaults.standard.set(supertonicVoice.rawValue, forKey: Keys.supertonicVoice)
+        }
+    }
+
+    var pocketVoice: PocketVoiceChoice {
+        didSet {
+            UserDefaults.standard.set(pocketVoice.rawValue, forKey: Keys.pocketVoice)
+        }
+    }
+
+    var speechOutputLanguage: SpeechOutputLanguage {
+        didSet {
+            UserDefaults.standard.set(speechOutputLanguage.rawValue, forKey: Keys.speechOutputLanguage)
+        }
+    }
+
+    var openRouterSpeechModel: String {
+        didSet {
+            UserDefaults.standard.set(openRouterSpeechModel, forKey: Keys.openRouterSpeechModel)
+        }
+    }
+
+    var openRouterSpeechVoice: String {
+        didSet {
+            UserDefaults.standard.set(openRouterSpeechVoice, forKey: Keys.openRouterSpeechVoice)
         }
     }
 
@@ -794,6 +1104,15 @@ final class Settings {
 
     private init() {
         let defaults = UserDefaults.standard
+        let storedOpenRouterModel = defaults.string(forKey: Keys.openRouterModel) ?? ""
+        let migratedOpenRouterModel =
+            OpenRouterPostProcessingService.modelIDRemovingDeprecatedOnlineVariant(
+                storedOpenRouterModel
+            )
+        let storedOpenRouterWebSearchEnabled =
+            defaults.object(forKey: Keys.agentOpenRouterWebSearchEnabled) as? Bool
+        let migratedOpenRouterWebSearchEnabled =
+            storedOpenRouterWebSearchEnabled ?? (migratedOpenRouterModel != storedOpenRouterModel)
 
         // Hotkey bindings (with migration from legacy single-hotkey format)
         if let data = defaults.data(forKey: Keys.hotkeyBindings),
@@ -889,6 +1208,38 @@ final class Settings {
             transcriptHistory = []
         }
 
+        agentBrainProvider = AgentBrainProvider(
+            rawValue: defaults.string(forKey: Keys.agentBrainProvider) ?? ""
+        ) ?? .appleIntelligence
+        if let savedAgentSystemPrompt = defaults.string(forKey: Keys.agentSystemPrompt) {
+            let migratedAgentSystemPrompt = VoiceAgentInstructions.migratingLegacyPrompt(
+                savedAgentSystemPrompt
+            )
+            agentSystemPrompt = migratedAgentSystemPrompt
+            if migratedAgentSystemPrompt != savedAgentSystemPrompt {
+                defaults.set(migratedAgentSystemPrompt, forKey: Keys.agentSystemPrompt)
+            }
+        } else {
+            agentSystemPrompt = VoiceAgentInstructions.system
+        }
+        agentOpenRouterWebSearchEnabled = migratedOpenRouterWebSearchEnabled
+        codexToolEnabled = defaults.object(forKey: Keys.codexToolEnabled) as? Bool ?? false
+        codexWorkspacePath = defaults.string(forKey: Keys.codexWorkspacePath) ?? ""
+        speechSynthesisModel = SpeechSynthesisModel(
+            rawValue: defaults.string(forKey: Keys.speechSynthesisModel) ?? ""
+        ) ?? .supertonic3
+        supertonicVoice = SupertonicVoiceChoice(
+            rawValue: defaults.string(forKey: Keys.supertonicVoice) ?? ""
+        ) ?? .m1
+        pocketVoice = PocketVoiceChoice(
+            rawValue: defaults.string(forKey: Keys.pocketVoice) ?? ""
+        ) ?? .alba
+        speechOutputLanguage = SpeechOutputLanguage(
+            rawValue: defaults.string(forKey: Keys.speechOutputLanguage) ?? ""
+        ) ?? .english
+        openRouterSpeechModel = defaults.string(forKey: Keys.openRouterSpeechModel) ?? ""
+        openRouterSpeechVoice = defaults.string(forKey: Keys.openRouterSpeechVoice) ?? ""
+
         // Transcript Post Processing
         if let storedModeRaw = defaults.string(forKey: Keys.transcriptPostProcessingMode),
            let storedMode = TranscriptPostProcessingMode(rawValue: storedModeRaw) {
@@ -909,7 +1260,13 @@ final class Settings {
             ?? Self.recommendedTranscriptCleanupPrompt
         let storedOpenRouterAPIKey = Self.storedOpenRouterAPIKey()
         openRouterAPIKey = storedOpenRouterAPIKey
-        openRouterModel = defaults.string(forKey: Keys.openRouterModel) ?? ""
+        openRouterModel = migratedOpenRouterModel
+        if migratedOpenRouterModel != storedOpenRouterModel {
+            defaults.set(migratedOpenRouterModel, forKey: Keys.openRouterModel)
+            if defaults.object(forKey: Keys.agentOpenRouterWebSearchEnabled) == nil {
+                defaults.set(true, forKey: Keys.agentOpenRouterWebSearchEnabled)
+            }
+        }
         openRouterPostProcessingPrompt = defaults.string(forKey: Keys.openRouterPostProcessingPrompt)
             ?? Self.recommendedTranscriptCleanupPrompt
         let storedOpenRouterCredentialHint = defaults.string(forKey: Keys.openRouterAPIKeyEnvironmentVariable)

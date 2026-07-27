@@ -73,6 +73,92 @@ final class ModelAndModeTests: XCTestCase {
         }
     }
 
+    // MARK: - Voice assistant
+
+    func testAgentBrainProvidersHaveStableNamesAndRawValues() {
+        XCTAssertEqual(
+            AgentBrainProvider.allCases,
+            [.appleIntelligence, .ollama, .openRouter]
+        )
+        XCTAssertEqual(AgentBrainProvider.appleIntelligence.displayName, "Apple Intelligence")
+        XCTAssertEqual(AgentBrainProvider.ollama.displayName, "Ollama")
+        XCTAssertEqual(AgentBrainProvider.openRouter.displayName, "OpenRouter")
+
+        for provider in AgentBrainProvider.allCases {
+            XCTAssertEqual(AgentBrainProvider(rawValue: provider.rawValue), provider)
+        }
+    }
+
+    // MARK: - Speech synthesis
+
+    func testSpeechSynthesisModelsHaveCompleteMetadata() {
+        XCTAssertEqual(
+            SpeechSynthesisModel.allCases,
+            [.supertonic3, .kokoroAne, .pocketTTS, .openRouter]
+        )
+
+        for model in SpeechSynthesisModel.allCases {
+            XCTAssertFalse(model.displayName.isEmpty)
+            XCTAssertFalse(model.detail.isEmpty)
+            XCTAssertFalse(model.languageSummary.isEmpty)
+            XCTAssertFalse(model.sampleRateSummary.isEmpty)
+            XCTAssertFalse(model.licenseSummary.isEmpty)
+            XCTAssertFalse(model.sizeSummary.isEmpty)
+            XCTAssertEqual(SpeechSynthesisModel(rawValue: model.rawValue), model)
+        }
+
+        XCTAssertEqual(SpeechSynthesisModel.localCases, [.supertonic3, .kokoroAne, .pocketTTS])
+        XCTAssertTrue(SpeechSynthesisModel.localCases.allSatisfy { $0.expectedDownloadBytes > 0 })
+        XCTAssertFalse(SpeechSynthesisModel.openRouter.isLocal)
+        XCTAssertEqual(SpeechSynthesisModel.openRouter.expectedDownloadBytes, 0)
+    }
+
+    func testSpeechVoiceChoicesHaveUniqueStableRawValues() {
+        XCTAssertEqual(SupertonicVoiceChoice.allCases.count, 10)
+        XCTAssertEqual(PocketVoiceChoice.allCases.count, 4)
+
+        for voice in SupertonicVoiceChoice.allCases {
+            XCTAssertFalse(voice.displayName.isEmpty)
+            XCTAssertEqual(SupertonicVoiceChoice(rawValue: voice.rawValue), voice)
+        }
+
+        for voice in PocketVoiceChoice.allCases {
+            XCTAssertFalse(voice.displayName.isEmpty)
+            XCTAssertEqual(PocketVoiceChoice(rawValue: voice.rawValue), voice)
+        }
+    }
+
+    func testSpeechOutputLanguagesAreCompleteAndStable() {
+        XCTAssertEqual(SpeechOutputLanguage.allCases.count, 31)
+        XCTAssertEqual(SpeechOutputLanguage.english.rawValue, "en")
+        XCTAssertEqual(
+            Set(SpeechOutputLanguage.allCases.map(\.rawValue)).count,
+            SpeechOutputLanguage.allCases.count
+        )
+
+        for language in SpeechOutputLanguage.allCases {
+            XCTAssertFalse(language.displayName.isEmpty)
+            XCTAssertEqual(SpeechOutputLanguage(rawValue: language.rawValue), language)
+        }
+    }
+
+    func testSpeechReadinessWarningExplainsMissingLocalModel() {
+        XCTAssertEqual(
+            SpeechReadinessWarning.message(for: .supertonic3, isReady: false),
+            "Supertonic-3 isn’t downloaded. Download it before the Voice Assistant can speak responses."
+        )
+        XCTAssertNil(
+            SpeechReadinessWarning.message(for: .supertonic3, isReady: true)
+        )
+    }
+
+    func testSpeechReadinessWarningExplainsIncompleteOpenRouterSetup() {
+        XCTAssertEqual(
+            SpeechReadinessWarning.message(for: .openRouter, isReady: false),
+            "OpenRouter speech isn’t ready. Add the shared API key, then choose a speech model and voice."
+        )
+    }
+
     // MARK: - AppAppearanceMode
 
     func testAppAppearanceModes() {
@@ -105,7 +191,17 @@ final class ModelAndModeTests: XCTestCase {
     func testSidebarPageOrderAndTitlesMatchDesign() {
         XCTAssertEqual(
             SidebarPage.allCases.map(\.title),
-            ["Speech Model", "General", "Shortcuts", "Text & Overlay", "Transcript Cleanup", "History", "About"]
+            [
+                "Dictation Model",
+                "Speech Model",
+                "General",
+                "Shortcuts",
+                "Voice Assistant",
+                "Text & Overlay",
+                "Transcript Cleanup",
+                "History",
+                "About",
+            ]
         )
     }
 

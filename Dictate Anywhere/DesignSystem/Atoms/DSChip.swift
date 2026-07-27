@@ -30,24 +30,27 @@ struct DSChip: View {
 }
 
 /// Atom: status pill with a colored dot ("Ready", "Not downloaded", …).
+/// The `tone` supplies dot, text and fill; the individual colors stay
+/// overridable for one-off cases.
 struct DSStatusPill: View {
     let text: String
-    var dotColor: Color = DS.Colors.success
-    var textColor: Color = DS.Colors.successText
-    var fill: Color = DS.Colors.successSoft
+    var tone: DS.Tone = .success
+    var dotColor: Color?
+    var textColor: Color?
+    var fill: Color?
 
     var body: some View {
         HStack(spacing: 6) {
             Circle()
-                .fill(dotColor)
+                .fill(dotColor ?? tone.icon)
                 .frame(width: 7, height: 7)
             Text(text)
                 .font(DS.Fonts.ui(12.5, .semibold))
-                .foregroundStyle(textColor)
+                .foregroundStyle(textColor ?? tone.text)
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 10)
-        .background(fill, in: Capsule())
+        .background(fill ?? tone.fill, in: Capsule())
     }
 }
 

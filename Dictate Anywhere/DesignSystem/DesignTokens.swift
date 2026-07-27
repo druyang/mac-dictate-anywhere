@@ -28,6 +28,29 @@ enum DS {
         static let successText = Color(hex: 0x3D7A4C)
         static let panelText = derivedAccent(saturation: 0.967, brightness: 0.621)
         static let destructive = Color(hex: 0xC0392B)
+
+        // Semantic message colors. These are deliberately *not* derived from
+        // the accent: a warning must never look like an error, and neither may
+        // look like the brand tint used by cards, chips and primary buttons.
+        static let neutralText = Color(hex: 0x6A6055)
+        static let neutralBorder = border
+
+        static let info = Color(hex: 0x4A7FA6)
+        static let infoSoft = Color(hex: 0xEAF1F7)
+        static let infoBorder = Color(hex: 0xCFE0EE)
+        static let infoText = Color(hex: 0x30586F)
+
+        static let successBorder = Color(hex: 0xC7DFCB)
+        static let successTextStrong = Color(hex: 0x356A42)
+
+        static let warning = Color(hex: 0xB8801B)
+        static let warningSoft = Color(hex: 0xFBF0D6)
+        static let warningBorder = Color(hex: 0xEEDBA8)
+        static let warningText = Color(hex: 0x7A5410)
+
+        static let dangerSoft = Color(hex: 0xFBE7E3)
+        static let dangerBorder = Color(hex: 0xF1CBC4)
+        static let dangerText = Color(hex: 0x8F2C1F)
         static let toggleOff = Color(hex: 0xDED4C2)
         static let sliderTrackRest = Color(hex: 0xE9DFCC)
         static let addButtonFill = Color(hex: 0xF1E9DB)
@@ -61,6 +84,81 @@ enum DS {
                 saturation: min(base.saturation * saturationScale, 1),
                 brightness: fixedBrightness ?? min(base.brightness * brightnessScale, 1)
             )
+        }
+    }
+
+    // MARK: - Semantic tones
+
+    /// Meaning of a message surface (panel, banner, status pill, status dot).
+    ///
+    /// Every tone owns its own hue so the meaning is readable before the copy
+    /// is: quiet help, neutral information, all-good, needs-attention, broken.
+    ///
+    /// The accent is deliberately *not* a tone. It's the brand tint — cards,
+    /// chips, primary buttons, links, the logo — and reusing it for messages is
+    /// what made warnings, errors and plain notes indistinguishable. Anything
+    /// that reports state picks a tone from its context instead; in-progress
+    /// work is `info`, not "brand orange".
+    enum Tone: CaseIterable {
+        case neutral
+        case info
+        case success
+        case warning
+        case danger
+
+        /// Tinted background of the surface.
+        var fill: Color {
+            switch self {
+            case .neutral: return Colors.bgInset
+            case .info: return Colors.infoSoft
+            case .success: return Colors.successSoft
+            case .warning: return Colors.warningSoft
+            case .danger: return Colors.dangerSoft
+            }
+        }
+
+        /// Hairline border that separates the surface from the card behind it.
+        var border: Color {
+            switch self {
+            case .neutral: return Colors.neutralBorder
+            case .info: return Colors.infoBorder
+            case .success: return Colors.successBorder
+            case .warning: return Colors.warningBorder
+            case .danger: return Colors.dangerBorder
+            }
+        }
+
+        /// Saturated color for the leading icon or status dot.
+        var icon: Color {
+            switch self {
+            case .neutral: return Colors.textSecondary
+            case .info: return Colors.info
+            case .success: return Colors.success
+            case .warning: return Colors.warning
+            case .danger: return Colors.destructive
+            }
+        }
+
+        /// Body copy color, dark enough to stay legible on `fill`.
+        var text: Color {
+            switch self {
+            case .neutral: return Colors.neutralText
+            case .info: return Colors.infoText
+            case .success: return Colors.successTextStrong
+            case .warning: return Colors.warningText
+            case .danger: return Colors.dangerText
+            }
+        }
+
+        /// Icon used when a call site doesn't supply one.
+        var defaultIcon: String {
+            switch self {
+            case .neutral: return "info.circle"
+            case .info: return "info.circle"
+            case .success: return "checkmark.circle"
+            case .warning: return "exclamationmark.triangle"
+            case .danger: return "xmark.circle"
+            }
         }
     }
 

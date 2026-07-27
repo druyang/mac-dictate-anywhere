@@ -57,17 +57,24 @@ struct SidebarView: View {
         case .idle:
             return appState.activeEngine.isReady ? "Ready to dictate" : "Model not set up"
         case .recording: return "Listening…"
-        case .processing: return "Transcribing…"
+        case .processing:
+            if appState.isAgentRequestInProgress {
+                return "Thinking and speaking…"
+            }
+            return appState.isSpeechOutputInProgress ? "Preparing voice…" : "Transcribing…"
         case .error: return "Something went wrong"
         }
     }
 
+    /// Idle-not-ready → grey, working → blue, ready → green, failed → red.
+    /// Work in progress is information, so it takes the info tone rather than
+    /// the brand accent, which would read as an alert next to the error state.
     private var statusColor: Color {
         switch appState.status {
         case .idle:
-            return appState.activeEngine.isReady ? DS.Colors.success : DS.Colors.textSecondary
-        case .recording, .processing: return DS.Colors.accent
-        case .error: return DS.Colors.destructive
+            return appState.activeEngine.isReady ? DS.Tone.success.icon : DS.Tone.neutral.icon
+        case .recording, .processing: return DS.Tone.info.icon
+        case .error: return DS.Tone.danger.icon
         }
     }
 }

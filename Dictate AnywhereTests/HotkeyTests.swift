@@ -99,6 +99,7 @@ final class HotkeyTests: XCTestCase {
         XCTAssertTrue(binding.modifiers.contains(.control))
         XCTAssertTrue(binding.modifiers.contains(.option))
         XCTAssertTrue(binding.modifiers.contains(.command))
+        XCTAssertEqual(binding.action, .dictate)
     }
 
     func testHasBindingFalseWhenEmpty() {
@@ -159,5 +160,43 @@ final class HotkeyTests: XCTestCase {
         XCTAssertEqual(HotkeyMode.holdToRecord.displayName, "Hold to Record")
         XCTAssertEqual(HotkeyMode.handsFreeToggle.displayName, "Tap to Toggle")
         XCTAssertEqual(HotkeyMode.allCases.count, 2)
+    }
+
+    func testHotkeyActionDisplayNames() {
+        XCTAssertEqual(HotkeyAction.dictate.displayName, "Dictate")
+        XCTAssertEqual(HotkeyAction.ask.displayName, "Ask")
+        XCTAssertEqual(HotkeyAction.allCases, [.dictate, .ask])
+    }
+
+    func testAskActionSurvivesCodableRoundTrip() throws {
+        let binding = HotkeyBinding(
+            id: UUID(),
+            keyCode: 49,
+            modifiersRawValue: HotkeyModifiers([.control, .option]).rawValue,
+            displayName: "⌃⌥Space",
+            mode: .holdToRecord,
+            action: .ask
+        )
+
+        let data = try JSONEncoder().encode(binding)
+        let decoded = try JSONDecoder().decode(HotkeyBinding.self, from: data)
+        XCTAssertEqual(decoded, binding)
+        XCTAssertEqual(decoded.action, .ask)
+    }
+
+    func testLegacyBindingWithoutActionMigratesToDictate() throws {
+        let id = UUID()
+        let legacyObject: [String: Any] = [
+            "id": id.uuidString,
+            "keyCode": 49,
+            "modifiersRawValue": HotkeyModifiers([.command]).rawValue,
+            "displayName": "⌘Space",
+            "mode": HotkeyMode.holdToRecord.rawValue,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: legacyObject)
+        let decoded = try JSONDecoder().decode(HotkeyBinding.self, from: data)
+
+        XCTAssertEqual(decoded.id, id)
+        XCTAssertEqual(decoded.action, .dictate)
     }
 }

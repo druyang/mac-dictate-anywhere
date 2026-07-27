@@ -7,10 +7,27 @@
 
 import SwiftUI
 
+enum SpeechReadinessWarning {
+    static func message(
+        for model: SpeechSynthesisModel,
+        isReady: Bool
+    ) -> String? {
+        guard !isReady else { return nil }
+
+        if model.isLocal {
+            return "\(model.displayName) isn’t downloaded. Download it before the Voice Assistant can speak responses."
+        }
+
+        return "OpenRouter speech isn’t ready. Add the shared API key, then choose a speech model and voice."
+    }
+}
+
 enum SidebarPage: String, CaseIterable, Identifiable {
     case models
+    case speechOutput
     case settings
     case shortcuts
+    case voiceAssistant
     case textOverlay
     case aiPostProcessing
     case history
@@ -20,9 +37,11 @@ enum SidebarPage: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .models: return "Speech Model"
+        case .models: return "Dictation Model"
+        case .speechOutput: return "Speech Model"
         case .settings: return "General"
         case .shortcuts: return "Shortcuts"
+        case .voiceAssistant: return "Voice Assistant"
         case .textOverlay: return "Text & Overlay"
         case .aiPostProcessing: return "Transcript Cleanup"
         case .history: return "History"
@@ -33,8 +52,10 @@ enum SidebarPage: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .models: return "cpu"
+        case .speechOutput: return "speaker.wave.3"
         case .settings: return "slider.horizontal.3"
         case .shortcuts: return "command"
+        case .voiceAssistant: return "waveform.and.mic"
         case .textOverlay: return "textformat"
         case .aiPostProcessing: return "wand.and.stars"
         case .history: return "clock.arrow.circlepath"
@@ -47,25 +68,26 @@ struct WarningBanner: View {
     let message: String
     let buttonTitle: String
     let action: () -> Void
+    var tone: DS.Tone = .warning
 
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(DS.Colors.accentDeep)
+                .foregroundStyle(tone.icon)
             Text(message)
                 .font(DS.Fonts.ui(12.5))
-                .foregroundStyle(DS.Colors.panelText)
+                .foregroundStyle(tone.text)
             Spacer()
             Button(buttonTitle, action: action)
                 .buttonStyle(.dsSecondary)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
-        .background(DS.Colors.accentSoft)
+        .background(tone.fill)
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(DS.Colors.border)
+                .fill(tone.border)
                 .frame(height: 1)
         }
     }
@@ -101,6 +123,15 @@ struct MainWindow: View {
                     }
                 }
 
+                if let speechWarningMessage {
+                    WarningBanner(
+                        message: speechWarningMessage,
+                        buttonTitle: "Set Up"
+                    ) {
+                        appState.selectedPage = .speechOutput
+                    }
+                }
+
                 detailView
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -115,15 +146,31 @@ struct MainWindow: View {
         )
     }
 
+    private var speechWarningMessage: String? {
+        let settings = appState.settings
+        let configuration = SpeechOutputConfiguration(settings: settings)
+        let isReady = settings.speechSynthesisModel.isLocal
+            ? appState.speechModelManager.isDownloaded(settings.speechSynthesisModel)
+            : configuration.isReady
+        return SpeechReadinessWarning.message(
+            for: settings.speechSynthesisModel,
+            isReady: isReady
+        )
+    }
+
     @ViewBuilder
     private var detailView: some View {
         switch appState.selectedPage {
         case .models:
             ModelsView()
+        case .speechOutput:
+            SpeechModelsView()
         case .settings:
             SettingsView()
         case .shortcuts:
             ShortcutsView()
+        case .voiceAssistant:
+            VoiceAssistantView()
         case .textOverlay:
             TextOverlayView()
         case .aiPostProcessing:

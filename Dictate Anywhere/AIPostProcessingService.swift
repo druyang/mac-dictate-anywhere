@@ -633,6 +633,130 @@ enum OllamaPostProcessingService {
         return cleanedRemotePostProcessingResponse(from: rawResponse, originalText: text)
     }
 
+    static func answer(
+        text: String,
+        baseURL: String,
+        model: String,
+        reasoning: OllamaReasoningSetting = .disabled,
+        instructions: String
+    ) async throws -> String {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else {
+            throw ServiceError.missingModel
+        }
+
+        var request = URLRequest(url: try endpointURL(baseURL: baseURL, endpoint: .generate))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 90
+
+        var payload: [String: Any] = [
+            "model": trimmedModel,
+            "system": instructions,
+            "prompt": text,
+            "stream": false,
+            "keep_alive": "10m",
+            "options": [
+                "temperature": 0.2
+            ]
+        ]
+        if let think = await thinkRequestValue(
+            for: reasoning,
+            baseURL: baseURL,
+            model: trimmedModel
+        ) {
+            payload["think"] = think
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        return try await performGenerateRequest(request)
+    }
+
+    static func streamAnswer(
+        text: String,
+        baseURL: String,
+        model: String,
+        reasoning: OllamaReasoningSetting = .disabled,
+        instructions: String
+    ) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmedModel.isEmpty else {
+                        throw ServiceError.missingModel
+                    }
+
+                    var request = URLRequest(url: try endpointURL(baseURL: baseURL, endpoint: .generate))
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.timeoutInterval = 90
+
+                    var payload: [String: Any] = [
+                        "model": trimmedModel,
+                        "system": instructions,
+                        "prompt": text,
+                        "stream": true,
+                        "keep_alive": "10m",
+                        "options": [
+                            "temperature": 0.2
+                        ]
+                    ]
+                    if let think = await thinkRequestValue(
+                        for: reasoning,
+                        baseURL: baseURL,
+                        model: trimmedModel
+                    ) {
+                        payload["think"] = think
+                    }
+                    request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    guard let httpResponse = response as? HTTPURLResponse else {
+                        throw ServiceError.invalidResponse
+                    }
+                    guard (200..<300).contains(httpResponse.statusCode) else {
+                        var data = Data()
+                        for try await byte in bytes {
+                            data.append(byte)
+                        }
+                        try validate(response: response, data: data)
+                        throw ServiceError.unexpectedStatus(httpResponse.statusCode)
+                    }
+
+                    let decoder = JSONDecoder()
+                    var cumulativeResponse = ""
+                    for try await line in bytes.lines {
+                        try Task.checkCancellation()
+                        let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmedLine.isEmpty else { continue }
+
+                        let decoded = try decoder.decode(GenerateResponse.self, from: Data(trimmedLine.utf8))
+                        if let error = decoded.error?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !error.isEmpty {
+                            throw ServiceError.serverMessage(error)
+                        }
+                        guard let chunk = decoded.response, !chunk.isEmpty else { continue }
+                        cumulativeResponse += chunk
+                        continuation.yield(cumulativeResponse)
+                    }
+
+                    guard !cumulativeResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw ServiceError.emptyResponse
+                    }
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
     static func cliAvailability() -> CLIAvailability {
         let pathEntries = (ProcessInfo.processInfo.environment["PATH"] ?? "")
             .split(separator: ":")
@@ -1330,6 +1454,21 @@ enum OpenRouterPostProcessingService {
         return components.joined(separator: ":")
     }
 
+    static func modelIDRemovingDeprecatedOnlineVariant(_ selectedModel: String) -> String {
+        let trimmedModel = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else { return "" }
+
+        var components = trimmedModel
+            .split(separator: ":", omittingEmptySubsequences: false)
+            .map(String.init)
+        guard components.count > 1, components.last?.lowercased() == "online" else {
+            return trimmedModel
+        }
+
+        components.removeLast()
+        return components.joined(separator: ":")
+    }
+
     static func process(
         text: String,
         model: String,
@@ -1367,6 +1506,167 @@ enum OpenRouterPostProcessingService {
             )
             return cleanedRemotePostProcessingResponse(from: rawResponse, originalText: text)
         }
+    }
+
+    static func answer(
+        text: String,
+        model: String,
+        instructions: String,
+        apiKey: String,
+        apiKeyEnvironmentVariable: String
+    ) async throws -> String {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else {
+            throw ServiceError.missingModel
+        }
+
+        let resolvedKey = try resolvedAPIKey(
+            apiKey: apiKey,
+            apiKeyEnvironmentVariable: apiKeyEnvironmentVariable
+        )
+        return try await performChatCompletionRequest(
+            model: trimmedModel,
+            apiKey: resolvedKey,
+            instructions: instructions,
+            prompt: text,
+            useStructuredOutputs: false,
+            temperature: 0.2
+        )
+    }
+
+    static func streamAnswer(
+        text: String,
+        model: String,
+        instructions: String,
+        webSearchEnabled: Bool = false,
+        apiKey: String,
+        apiKeyEnvironmentVariable: String
+    ) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmedModel.isEmpty else {
+                        throw ServiceError.missingModel
+                    }
+                    let resolvedKey = try resolvedAPIKey(
+                        apiKey: apiKey,
+                        apiKeyEnvironmentVariable: apiKeyEnvironmentVariable
+                    )
+
+                    let request = try makeStreamingAnswerRequest(
+                        text: text,
+                        model: trimmedModel,
+                        instructions: instructions,
+                        webSearchEnabled: webSearchEnabled,
+                        apiKey: resolvedKey
+                    )
+
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    guard let httpResponse = response as? HTTPURLResponse else {
+                        throw ServiceError.invalidResponse
+                    }
+                    guard (200..<300).contains(httpResponse.statusCode) else {
+                        var data = Data()
+                        for try await byte in bytes {
+                            data.append(byte)
+                        }
+                        try validate(response: response, data: data)
+                        throw ServiceError.unexpectedStatus(httpResponse.statusCode)
+                    }
+
+                    let decoder = JSONDecoder()
+                    var cumulativeResponse = ""
+                    for try await line in bytes.lines {
+                        try Task.checkCancellation()
+                        let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard trimmedLine.hasPrefix("data:") else { continue }
+
+                        let payload = trimmedLine.dropFirst(5)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard payload != "[DONE]" else { break }
+                        guard !payload.isEmpty else { continue }
+
+                        let decoded = try decoder.decode(
+                            StreamChatCompletionResponse.self,
+                            from: Data(payload.utf8)
+                        )
+                        if let message = decoded.error?.message?
+                            .trimmingCharacters(in: .whitespacesAndNewlines),
+                           !message.isEmpty {
+                            throw ServiceError.serverMessage(message)
+                        }
+                        guard let chunk = decoded.choices?.first?.delta.content, !chunk.isEmpty else {
+                            continue
+                        }
+                        cumulativeResponse += chunk
+                        continuation.yield(cumulativeResponse)
+                    }
+
+                    guard !cumulativeResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw ServiceError.emptyResponse
+                    }
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    static func makeStreamingAnswerRequest(
+        text: String,
+        model: String,
+        instructions: String,
+        webSearchEnabled: Bool,
+        apiKey: String
+    ) throws -> URLRequest {
+        let resolvedModel = modelIDRemovingDeprecatedOnlineVariant(model)
+        guard !resolvedModel.isEmpty else {
+            throw ServiceError.missingModel
+        }
+
+        var request = URLRequest(url: endpointURL(path: "chat/completions"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 90
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue(appAttributionURL, forHTTPHeaderField: "HTTP-Referer")
+        request.setValue(appTitle, forHTTPHeaderField: "X-OpenRouter-Title")
+        request.setValue(appTitle, forHTTPHeaderField: "X-Title")
+
+        var payload: [String: Any] = [
+            "model": resolvedModel,
+            "messages": [
+                [
+                    "role": "system",
+                    "content": instructions
+                ],
+                [
+                    "role": "user",
+                    "content": text
+                ]
+            ],
+            "temperature": 0.2,
+            "stream": true
+        ]
+        if webSearchEnabled {
+            payload["tools"] = [
+                [
+                    "type": "openrouter:web_search"
+                ]
+            ]
+            payload["max_tool_calls"] = 3
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        return request
     }
 
     private struct ModelsResponse: Decodable {
@@ -1442,6 +1742,19 @@ enum OpenRouterPostProcessingService {
         let choices: [Choice]
     }
 
+    private struct StreamChatCompletionResponse: Decodable {
+        struct Choice: Decodable {
+            struct Delta: Decodable {
+                let content: String?
+            }
+
+            let delta: Delta
+        }
+
+        let choices: [Choice]?
+        let error: ErrorResponse.ErrorPayload?
+    }
+
     private struct ErrorResponse: Decodable {
         struct ErrorPayload: Decodable {
             let message: String?
@@ -1487,7 +1800,8 @@ enum OpenRouterPostProcessingService {
         apiKey: String,
         instructions: String,
         prompt: String,
-        useStructuredOutputs: Bool
+        useStructuredOutputs: Bool,
+        temperature: Double = 0
     ) async throws -> String {
         var request = URLRequest(url: endpointURL(path: "chat/completions"))
         request.httpMethod = "POST"
@@ -1510,7 +1824,7 @@ enum OpenRouterPostProcessingService {
                     "content": prompt
                 ]
             ],
-            "temperature": 0
+            "temperature": temperature
         ]
 
         if useStructuredOutputs {
@@ -1577,7 +1891,7 @@ enum OpenRouterPostProcessingService {
         return fallbackSignals.contains { normalized.contains($0) }
     }
 
-    private static func resolvedAPIKey(apiKey: String, apiKeyEnvironmentVariable: String) throws -> String {
+    static func resolvedAPIKey(apiKey: String, apiKeyEnvironmentVariable: String) throws -> String {
         let trimmedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedAPIKey.isEmpty {
             return trimmedAPIKey

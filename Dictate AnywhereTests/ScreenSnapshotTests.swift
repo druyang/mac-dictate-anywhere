@@ -42,9 +42,11 @@ final class ScreenSnapshotTests: XCTestCase {
         }
     }
 
-    func testSpeechModelScreenRenders() { renderWindow(page: .models) }
+    func testDictationModelScreenRenders() { renderWindow(page: .models) }
+    func testSpeechModelScreenRenders() { renderWindow(page: .speechOutput) }
     func testGeneralScreenRenders() { renderWindow(page: .settings) }
     func testShortcutsScreenRenders() { renderWindow(page: .shortcuts) }
+    func testVoiceAssistantScreenRenders() { renderWindow(page: .voiceAssistant) }
     func testTextOverlayScreenRenders() { renderWindow(page: .textOverlay) }
     func testTranscriptCleanupScreenRenders() { renderWindow(page: .aiPostProcessing) }
     func testHistoryScreenRenders() { renderWindow(page: .history) }

@@ -45,6 +45,11 @@ final class AppState {
     var ollamaModelActionError: String?
     var ollamaModelActionsRevision = 0
     var enginePreparationError: String?
+    var lastAgentRequest = ""
+    var lastAgentResponse = ""
+    var lastAgentError: String?
+    var isAgentRequestInProgress = false
+    var isSpeechOutputInProgress = false
 
     /// Static accessor for AppDelegate menu bar (avoids circular dependency)
     nonisolated(unsafe) static var lastTranscriptForMenuBar = ""
@@ -61,6 +66,8 @@ final class AppState {
     let audioDeviceManager = AudioDeviceManager()
     let parakeetEngine = ParakeetEngine()
     let appleSpeechEngine = AppleSpeechEngine()
+    let speechModelManager = SpeechModelManager()
+    let speechOutputService = SpeechOutputService()
     var appleSpeechSupportedLanguages: [SupportedLanguage] = []
     private var isShowingMigrationAlert = false
 
@@ -82,6 +89,9 @@ final class AppState {
     /// Engine pinned for the active dictation session (start -> stop/cancel).
     private var sessionEngine: TranscriptionEngine?
     private var sessionHotkeyMode: HotkeyMode?
+    private var sessionHotkeyAction: HotkeyAction?
+    private var agentRequestGeneration = 0
+    private var agentRequestTask: Task<Void, Never>?
     private var startupTask: Task<Void, Never>?
     private var hasStarted = false
 
@@ -115,12 +125,12 @@ final class AppState {
                 guard let self else { return }
                 switch binding.mode {
                 case .holdToRecord:
-                    await self.startDictation(mode: binding.mode)
+                    await self.startDictation(mode: binding.mode, action: binding.action)
                 case .handsFreeToggle:
                     if self.status == .recording {
                         await self.stopDictation()
                     } else {
-                        await self.startDictation(mode: binding.mode)
+                        await self.startDictation(mode: binding.mode, action: binding.action)
                     }
                 }
             }
@@ -167,6 +177,7 @@ final class AppState {
     private func runStartupSequence() async {
         await permissions.check()
         updateAccessibilityIntegration(granted: permissions.accessibilityGranted, promptIfNeeded: true)
+        speechModelManager.refresh()
         await prepareActiveEngine()
     }
 
@@ -344,7 +355,11 @@ final class AppState {
 
     // MARK: - Dictation Flow
 
-    func startDictation(mode: HotkeyMode? = nil) async {
+    func startDictation(
+        mode: HotkeyMode? = nil,
+        action: HotkeyAction = .dictate
+    ) async {
+        interruptAgentSessionForNewSession()
         logger.info("startDictation: entry, status=\(String(describing: self.status), privacy: .public), isTransitioning=\(self.isTransitioning, privacy: .public), engineChoice=\(String(describing: self.settings.engineChoice), privacy: .public)")
         if case .error = status {
             status = .idle
@@ -384,12 +399,17 @@ final class AppState {
                 return
             }
         }
-        captureInsertionTargetApp()
+        if action == .dictate {
+            captureInsertionTargetApp()
+        } else {
+            insertionTargetApp = nil
+        }
 
         isTransitioning = true
         pendingHoldRelease = false
         sessionEngine = engine
         sessionHotkeyMode = mode
+        sessionHotkeyAction = action
         configureEndOfUtteranceHandler(for: engine)
 
         status = .recording
@@ -471,6 +491,7 @@ final class AppState {
             clearEndOfUtteranceHandler(for: engine)
             sessionEngine = nil
             sessionHotkeyMode = nil
+            sessionHotkeyAction = nil
             status = .idle
             return
         }
@@ -493,7 +514,6 @@ final class AppState {
     func stopDictation() async {
         guard status == .recording, !isTransitioning else { return }
         isTransitioning = true
-        defer { isTransitioning = false }
 
         status = .processing
         stopAudioLevelPolling()
@@ -505,12 +525,14 @@ final class AppState {
         settings.playSound("Pop")
 
         let engine = sessionEngine ?? activeEngine
+        let sessionAction = sessionHotkeyAction ?? .dictate
 
         // Get final transcript
         let transcript = await engine.stopRecording()
         clearEndOfUtteranceHandler(for: engine)
         sessionEngine = nil
         sessionHotkeyMode = nil
+        sessionHotkeyAction = nil
 
         // Apply filler word removal
         let cleaned = settings.removeFillerWords(from: transcript).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -529,6 +551,22 @@ final class AppState {
             overlay.hide(afterDelay: 0.5)
             status = .idle
             insertionTargetApp = nil
+            isTransitioning = false
+            return
+        }
+
+        if sessionAction == .ask {
+            currentTranscript = finalText
+            lastTranscript = finalText
+            Self.lastTranscriptForMenuBar = finalText
+            settings.addTranscriptHistoryEntry(finalText)
+            insertionTargetApp = nil
+            await restoreRecordingAudio()
+            // Recording has fully stopped. The agent request owns its own
+            // cancellation state and must not keep the recording transition
+            // lock held while it generates or speaks a response.
+            isTransitioning = false
+            await performAgentRequest(prompt: finalText)
             return
         }
 
@@ -649,9 +687,15 @@ final class AppState {
 
         overlay.hide(afterDelay: 1.0)
         status = .idle
+        isTransitioning = false
     }
 
     func cancelDictation() async {
+        if sessionEngine == nil, isAgentRequestInProgress {
+            interruptAgentSessionForNewSession()
+            return
+        }
+
         guard status == .recording || status == .processing else { return }
 
         stopAudioLevelPolling()
@@ -661,6 +705,7 @@ final class AppState {
         clearEndOfUtteranceHandler(for: engine)
         sessionEngine = nil
         sessionHotkeyMode = nil
+        sessionHotkeyAction = nil
 
         volumeController.restoreMicrophoneVolume()
         if settings.muteSystemAudioDuringRecordingEnabled {
@@ -672,6 +717,222 @@ final class AppState {
         overlay.hide(afterDelay: 0)
         status = .idle
         insertionTargetApp = nil
+    }
+
+    func askAgent(prompt: String) async {
+        interruptAgentSessionForNewSession()
+        guard status == .idle, !isTransitioning else { return }
+        status = .processing
+        overlay.show(state: .processing)
+        await performAgentRequest(prompt: prompt)
+    }
+
+    private func performAgentRequest(prompt: String) async {
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPrompt.isEmpty else {
+            status = .idle
+            overlay.hide(afterDelay: 0)
+            return
+        }
+
+        agentRequestTask?.cancel()
+        agentRequestGeneration += 1
+        let generation = agentRequestGeneration
+        let task = Task<Void, Never> { @MainActor [weak self] in
+            guard let self else { return }
+            await self.executeAgentRequest(
+                prompt: trimmedPrompt,
+                generation: generation
+            )
+        }
+        agentRequestTask = task
+        await task.value
+        if generation == agentRequestGeneration {
+            agentRequestTask = nil
+        }
+    }
+
+    private func executeAgentRequest(prompt trimmedPrompt: String, generation: Int) async {
+        guard !Task.isCancelled, generation == agentRequestGeneration else { return }
+        lastAgentRequest = trimmedPrompt
+        lastAgentResponse = ""
+        lastAgentError = nil
+        isAgentRequestInProgress = true
+        status = .processing
+        overlay.show(state: .processing)
+
+        do {
+            var response = ""
+            let eventStream = VoiceAgentService.streamEvents(
+                to: trimmedPrompt,
+                configuration: VoiceAgentService.Configuration(settings: settings)
+            )
+            for try await event in eventStream {
+                switch event {
+                case .toolStatus(let toolStatus):
+                    if generation == agentRequestGeneration {
+                        await speakAgentToolStatus(
+                            toolStatus.message,
+                            generation: generation
+                        )
+                    }
+                    await toolStatus.didFinishSpeaking()
+                    guard !Task.isCancelled,
+                          generation == agentRequestGeneration else { return }
+                case .response(let partialResponse):
+                    guard generation == agentRequestGeneration else { return }
+                    response = partialResponse
+                    lastAgentResponse = partialResponse
+                    currentTranscript = partialResponse
+                }
+            }
+            try Task.checkCancellation()
+            guard generation == agentRequestGeneration else { return }
+
+            let playbackTimeline = SpokenResponsePlaybackTimeline(text: response)
+            do {
+                try await speechOutputService.speak(
+                    response,
+                    configuration: SpeechOutputConfiguration(settings: settings),
+                    onPlaybackProgress: { [weak self] progress in
+                        guard let self, generation == agentRequestGeneration else { return }
+                        overlay.show(
+                            state: .response(
+                                text: playbackTimeline.text(at: progress),
+                                isComplete: progress >= 1
+                            )
+                        )
+                    }
+                )
+            } catch {
+                guard !Task.isCancelled, generation == agentRequestGeneration else { return }
+                lastAgentError = "The response was generated, but \(error.localizedDescription)"
+                overlay.show(state: .error)
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled, generation == agentRequestGeneration else { return }
+
+            let errorMessage = error.localizedDescription
+            lastAgentError = errorMessage
+            overlay.show(state: .error)
+            await speakAgentError(errorMessage, generation: generation)
+        }
+
+        guard !Task.isCancelled, generation == agentRequestGeneration else { return }
+        isAgentRequestInProgress = false
+        overlay.hide(afterDelay: 0.6)
+        status = .idle
+    }
+
+    private func speakAgentToolStatus(_ message: String, generation: Int) async {
+        guard !message.isEmpty,
+              !Task.isCancelled,
+              generation == agentRequestGeneration else { return }
+
+        currentTranscript = message
+        let playbackTimeline = SpokenResponsePlaybackTimeline(text: message)
+        do {
+            try await speechOutputService.speak(
+                message,
+                configuration: SpeechOutputConfiguration(settings: settings),
+                onPlaybackProgress: { [weak self] progress in
+                    guard let self, generation == agentRequestGeneration else { return }
+                    overlay.show(
+                        state: .response(
+                            text: playbackTimeline.text(at: progress),
+                            isComplete: progress >= 1
+                        )
+                    )
+                }
+            )
+        } catch {
+            guard !Task.isCancelled, generation == agentRequestGeneration else { return }
+        }
+
+        guard !Task.isCancelled, generation == agentRequestGeneration else { return }
+        currentTranscript = ""
+        overlay.show(state: .processing)
+    }
+
+    private func interruptAgentSessionForNewSession() {
+        guard isAgentRequestInProgress || agentRequestTask != nil else { return }
+
+        agentRequestGeneration += 1
+        agentRequestTask?.cancel()
+        agentRequestTask = nil
+        speechOutputService.stop()
+        isAgentRequestInProgress = false
+        currentTranscript = ""
+        overlay.hide(afterDelay: 0)
+        status = .idle
+    }
+
+    private func speakAgentError(_ message: String, generation: Int) async {
+        guard generation == agentRequestGeneration else { return }
+        let spokenMessage = SpokenResponseFormatter.errorText(from: message)
+        guard !spokenMessage.isEmpty else { return }
+
+        let configuration = SpeechOutputConfiguration(settings: settings)
+        guard configuration.isReady else { return }
+
+        // If error speech itself fails, keep the original visible error and
+        // avoid recursively trying the same unavailable speech provider.
+        try? await speechOutputService.speak(
+            spokenMessage,
+            configuration: configuration
+        )
+    }
+
+    func downloadSpeechModel(_ model: SpeechSynthesisModel) async {
+        guard status == .idle, model.isLocal else { return }
+        do {
+            try await speechModelManager.download(
+                model,
+                supertonicVoice: settings.supertonicVoice
+            )
+        } catch {
+            speechModelManager.errorMessage = error.localizedDescription
+        }
+    }
+
+    func deleteSpeechModel(_ model: SpeechSynthesisModel) async {
+        guard status == .idle, model.isLocal else { return }
+        await speechOutputService.unload(model)
+        do {
+            try speechModelManager.delete(model)
+        } catch {
+            speechModelManager.errorMessage = error.localizedDescription
+        }
+    }
+
+    func previewSpeechOutput() async {
+        guard status == .idle else { return }
+        speechModelManager.errorMessage = nil
+        isSpeechOutputInProgress = true
+        status = .processing
+        defer {
+            isSpeechOutputInProgress = false
+            status = .idle
+        }
+
+        do {
+            try await speechOutputService.speak(
+                "This is how Dictate Anywhere will sound when it answers you.",
+                configuration: SpeechOutputConfiguration(settings: settings)
+            )
+        } catch {
+            speechModelManager.errorMessage = error.localizedDescription
+        }
+    }
+
+    private func restoreRecordingAudio() async {
+        volumeController.restoreMicrophoneVolume()
+        if settings.muteSystemAudioDuringRecordingEnabled {
+            try? await Task.sleep(for: .milliseconds(200))
+            volumeController.restoreAfterRecording()
+        }
     }
 
     // MARK: - Audio Level Polling

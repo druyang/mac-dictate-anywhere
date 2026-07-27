@@ -90,6 +90,87 @@ final class DesignSystemTests: XCTestCase {
         XCTAssertEqual(c.b, Double(0x20) / 255, accuracy: 0.001)
     }
 
+    // MARK: - Semantic tones
+
+    /// sRGB relative luminance per WCAG 2.1.
+    private func luminance(_ color: Color) -> Double {
+        let c = components(color)
+        func channel(_ value: Double) -> Double {
+            value <= 0.03928 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b)
+    }
+
+    private func contrastRatio(_ a: Color, _ b: Color) -> Double {
+        let (l1, l2) = (luminance(a), luminance(b))
+        return (max(l1, l2) + 0.05) / (min(l1, l2) + 0.05)
+    }
+
+    private func isSameColor(_ a: Color, _ b: Color) -> Bool {
+        let (x, y) = (components(a), components(b))
+        return abs(x.r - y.r) < 0.004 && abs(x.g - y.g) < 0.004 && abs(x.b - y.b) < 0.004
+    }
+
+    /// A warning must never be paintable as an error (or as a brand tip):
+    /// every tone owns a fill and an icon color no other tone uses.
+    func testEveryToneIsVisuallyDistinct() {
+        let tones = DS.Tone.allCases
+        for (index, tone) in tones.enumerated() {
+            for other in tones[(index + 1)...] {
+                XCTAssertFalse(
+                    isSameColor(tone.fill, other.fill),
+                    "\(tone) and \(other) share the same panel fill"
+                )
+                XCTAssertFalse(
+                    isSameColor(tone.icon, other.icon),
+                    "\(tone) and \(other) share the same icon color"
+                )
+                XCTAssertFalse(
+                    isSameColor(tone.text, other.text),
+                    "\(tone) and \(other) share the same text color"
+                )
+            }
+        }
+    }
+
+    /// The accent is the brand tint used by cards, chips, links and primary
+    /// buttons. No tone may reuse it — that's what made every message, whatever
+    /// its meaning, render as the same alarming card.
+    func testNoToneReusesTheAccentPalette() {
+        for tone in DS.Tone.allCases {
+            XCTAssertFalse(isSameColor(tone.fill, DS.Colors.accentSoft), "\(tone) reuses accentSoft")
+            XCTAssertFalse(isSameColor(tone.icon, DS.Colors.accent), "\(tone) reuses accent")
+            XCTAssertFalse(isSameColor(tone.icon, DS.Colors.accentDeep), "\(tone) reuses accentDeep")
+            XCTAssertFalse(isSameColor(tone.text, DS.Colors.panelText), "\(tone) reuses panelText")
+        }
+    }
+
+    /// Body copy on a tinted panel must clear WCAG AA for normal text.
+    func testToneTextMeetsContrastOnItsOwnFill() {
+        for tone in DS.Tone.allCases {
+            let ratio = contrastRatio(tone.text, tone.fill)
+            XCTAssertGreaterThanOrEqual(
+                ratio, 4.5,
+                "\(tone) body text contrast is \(String(format: "%.2f", ratio)):1"
+            )
+        }
+    }
+
+    /// The tone list is purely semantic: there is no brand tone to reach for,
+    /// so a status surface has to pick a meaning from its context.
+    func testToneVocabularyIsSemanticOnly() {
+        XCTAssertEqual(DS.Tone.allCases, [.neutral, .info, .success, .warning, .danger])
+    }
+
+    /// Each tone needs a glyph of its own so the meaning survives at a glance
+    /// (and for anyone who can't separate the hues).
+    func testSeverityTonesCarryDistinctDefaultIcons() {
+        XCTAssertEqual(DS.Tone.success.defaultIcon, "checkmark.circle")
+        XCTAssertEqual(DS.Tone.warning.defaultIcon, "exclamationmark.triangle")
+        XCTAssertEqual(DS.Tone.danger.defaultIcon, "xmark.circle")
+        XCTAssertNotEqual(DS.Tone.warning.defaultIcon, DS.Tone.danger.defaultIcon)
+    }
+
     func testFontFamiliesMatchDesign() {
         XCTAssertEqual(DS.Fonts.displayFamily, "Fraunces")
         XCTAssertEqual(DS.Fonts.uiFamily, "Inter")

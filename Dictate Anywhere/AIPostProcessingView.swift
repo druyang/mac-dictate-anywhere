@@ -73,6 +73,7 @@ struct AIPostProcessingView: View {
             case .none:
                 DSPanel(
                     text: "No AI cleanup will run. The raw FluidAudio transcript is pasted after the local filler-word cleanup above.",
+                    tone: .info,
                     icon: "sparkles"
                 )
             case .fluidAudioVocabulary:
@@ -83,7 +84,7 @@ struct AIPostProcessingView: View {
                 } else {
                     DSPanel(
                         text: "Apple Intelligence transcript processing requires macOS 26 or later.",
-                        icon: "exclamationmark.triangle"
+                        tone: .warning
                     )
                 }
             case .ollama:
@@ -234,7 +235,7 @@ struct AIPostProcessingView: View {
         if settings.parakeetModelChoice.usesTrueStreaming {
             DSPanel(
                 text: "FluidAudio Vocabulary is only available with Parakeet TDT models. Choose Multilingual, English Only, or English Compact to use vocabulary rescoring. For streaming models, use Apple Intelligence, Ollama, OpenRouter, or OpenAI Compatible cleanup.",
-                icon: "exclamationmark.triangle"
+                tone: .warning
             )
         } else {
             vocabularySection(
@@ -274,7 +275,7 @@ struct AIPostProcessingView: View {
         case .unavailable(.deviceNotEligible):
             DSPanel(
                 text: "Your Mac doesn't support Apple Intelligence. AI Post Processing requires a Mac that supports Apple Intelligence.",
-                icon: "xmark.circle"
+                tone: .danger
             )
 
         case .unavailable(.appleIntelligenceNotEnabled):
@@ -282,7 +283,7 @@ struct AIPostProcessingView: View {
                 cardPadded {
                     HStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle")
-                            .foregroundStyle(DS.Colors.accentDeep)
+                            .foregroundStyle(DS.Tone.warning.icon)
                         Text("Apple Intelligence is not enabled")
                             .font(DS.Fonts.ui(13.5, .medium))
                             .foregroundStyle(DS.Colors.ink)
@@ -303,7 +304,7 @@ struct AIPostProcessingView: View {
                 cardPadded {
                     HStack(spacing: 8) {
                         Image(systemName: "arrow.down.circle")
-                            .foregroundStyle(DS.Colors.accent)
+                            .foregroundStyle(DS.Tone.info.icon)
                         Text("Apple Intelligence model is downloading…")
                             .font(DS.Fonts.ui(13.5, .medium))
                             .foregroundStyle(DS.Colors.ink)
@@ -318,7 +319,7 @@ struct AIPostProcessingView: View {
         case .unavailable(_):
             DSPanel(
                 text: "Apple Intelligence is currently unavailable. Try again later.",
-                icon: "exclamationmark.triangle"
+                tone: .warning
             )
         }
     }
@@ -756,18 +757,11 @@ struct AIPostProcessingView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             FlowLayout(spacing: 6) {
-                ollamaBadge(
-                    text: suggestion.badge,
-                    foreground: DS.Colors.accent,
-                    background: DS.Colors.accentSoft
-                )
+                // "Recommended" is editorial information, not a status.
+                ollamaBadge(text: suggestion.badge, tone: .info)
 
                 if isInstalled {
-                    ollamaBadge(
-                        text: "Installed",
-                        foreground: DS.Colors.successText,
-                        background: DS.Colors.successSoft
-                    )
+                    ollamaBadge(text: "Installed", tone: .success)
                 }
 
                 if isSelected {
@@ -779,19 +773,11 @@ struct AIPostProcessingView: View {
                 }
 
                 if let downloadSizeLabel {
-                    ollamaBadge(
-                        text: downloadSizeLabel,
-                        foreground: DS.Colors.textSecondary,
-                        background: DS.Colors.bgInset
-                    )
+                    ollamaBadge(text: downloadSizeLabel, tone: .neutral)
                 }
 
                 if let parameterSizeLabel {
-                    ollamaBadge(
-                        text: parameterSizeLabel,
-                        foreground: DS.Colors.textSecondary,
-                        background: DS.Colors.bgInset
-                    )
+                    ollamaBadge(text: parameterSizeLabel, tone: .neutral)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1008,6 +994,10 @@ struct AIPostProcessingView: View {
     }
 
     @ViewBuilder
+    private func ollamaBadge(text: String, tone: DS.Tone) -> some View {
+        ollamaBadge(text: text, foreground: tone.text, background: tone.fill)
+    }
+
     private func ollamaBadge(text: String, foreground: Color, background: Color) -> some View {
         Text(text)
             .font(DS.Fonts.ui(11, .semibold))
@@ -1081,15 +1071,17 @@ struct AIPostProcessingView: View {
     // MARK: - Status views
 
     @ViewBuilder
-    private func statusLabel(_ text: String, systemImage: String, tint: Color) -> some View {
+    private func statusLabel(_ text: String, systemImage: String, tone: DS.Tone) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: systemImage)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(tint)
+                .foregroundStyle(tone.icon)
                 .padding(.top, 1)
             Text(text)
                 .font(DS.Fonts.ui(12.5))
-                .foregroundStyle(DS.Colors.textSecondary)
+                // Only failures color their copy; everything else stays quiet
+                // so the icon carries the severity.
+                .foregroundStyle(tone == .danger ? tone.text : DS.Colors.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -1109,41 +1101,41 @@ struct AIPostProcessingView: View {
             statusLabel(
                 "Ollama is not installed on this Mac yet. Install it to run transcript cleanup locally, or enter a remote Ollama server URL.",
                 systemImage: "info.circle",
-                tint: DS.Colors.accent
+                tone: .info
             )
         } else if let message = ollamaStatusMessage {
-            statusLabel(message, systemImage: "xmark.circle", tint: DS.Colors.destructive)
+            statusLabel(message, systemImage: "xmark.circle", tone: .danger)
         } else if let availability = ollamaAvailability {
             if availability.installedModels.isEmpty {
                 statusLabel(
                     "Connected, but no Ollama models are installed yet.",
                     systemImage: "exclamationmark.triangle",
-                    tint: DS.Colors.accentDeep
+                    tone: .warning
                 )
             } else if availability.selectedModel.isEmpty {
                 statusLabel(
                     "Connected. Choose an installed model below or enter one manually.",
                     systemImage: "checkmark.circle",
-                    tint: DS.Colors.success
+                    tone: .success
                 )
             } else if availability.selectedModelIsInstalled {
                 statusLabel(
                     "Connected. \(availability.resolvedSelectedModel ?? availability.selectedModel) is available.",
                     systemImage: "checkmark.circle",
-                    tint: DS.Colors.success
+                    tone: .success
                 )
             } else {
                 statusLabel(
                     "Connected, but \(availability.selectedModel) is not installed on this Ollama server.",
                     systemImage: "exclamationmark.triangle",
-                    tint: DS.Colors.accentDeep
+                    tone: .warning
                 )
             }
         } else {
             statusLabel(
                 "Enter your Ollama server URL to check connectivity.",
                 systemImage: "bolt.horizontal.circle",
-                tint: DS.Colors.textSecondary
+                tone: .neutral
             )
         }
     }
@@ -1169,12 +1161,12 @@ struct AIPostProcessingView: View {
                     .foregroundStyle(DS.Colors.textSecondary)
             }
         } else if let message = openRouterStatusMessage {
-            statusLabel(message, systemImage: "xmark.circle", tint: DS.Colors.destructive)
+            statusLabel(message, systemImage: "xmark.circle", tone: .danger)
         } else if case .missing = apiKeyStatus.source {
             statusLabel(
                 "No OpenRouter API key is configured yet. Paste one above or set \(apiKeyStatus.environmentVariableName) in the app environment.",
                 systemImage: "key.slash",
-                tint: DS.Colors.accentDeep
+                tone: .warning
             )
         } else if let resolvedModel {
             statusLabel(
@@ -1184,25 +1176,25 @@ struct AIPostProcessingView: View {
                     apiKeyStatus: apiKeyStatus
                 ),
                 systemImage: resolvedModel.supportsStructuredOutputs ? "checkmark.circle" : "exclamationmark.triangle",
-                tint: resolvedModel.supportsStructuredOutputs ? DS.Colors.success : DS.Colors.accentDeep
+                tone: resolvedModel.supportsStructuredOutputs ? .success : .warning
             )
         } else if !selectedModel.isEmpty {
             statusLabel(
                 "\(openRouterCredentialSourceMessage(apiKeyStatus)) \(selectedModel) was not found in the latest OpenRouter model refresh.",
                 systemImage: "exclamationmark.triangle",
-                tint: DS.Colors.accentDeep
+                tone: .warning
             )
         } else if openRouterAvailability != nil {
             statusLabel(
                 "\(openRouterCredentialSourceMessage(apiKeyStatus)) Enter a model id above or search the fetched catalog below.",
                 systemImage: "checkmark.circle",
-                tint: DS.Colors.success
+                tone: .success
             )
         } else {
             statusLabel(
                 "Refresh models to validate your OpenRouter setup and search the available catalog.",
                 systemImage: "network",
-                tint: DS.Colors.textSecondary
+                tone: .neutral
             )
         }
     }
@@ -1264,38 +1256,38 @@ struct AIPostProcessingView: View {
                     .foregroundStyle(DS.Colors.textSecondary)
             }
         } else if let message = openAICompatibleStatusMessage {
-            statusLabel(message, systemImage: "xmark.circle", tint: DS.Colors.destructive)
+            statusLabel(message, systemImage: "xmark.circle", tone: .danger)
         } else if let availability = openAICompatibleAvailability {
             if availability.models.isEmpty {
                 statusLabel(
                     "Connected, but the server did not report any models.",
                     systemImage: "exclamationmark.triangle",
-                    tint: DS.Colors.accentDeep
+                    tone: .warning
                 )
             } else if selectedModel.isEmpty {
                 statusLabel(
                     "Connected. Choose a model below or enter one manually.",
                     systemImage: "checkmark.circle",
-                    tint: DS.Colors.success
+                    tone: .success
                 )
             } else if availability.selectedModelIsAvailable {
                 statusLabel(
                     "Connected. \(selectedModel) is available.",
                     systemImage: "checkmark.circle",
-                    tint: DS.Colors.success
+                    tone: .success
                 )
             } else {
                 statusLabel(
                     "Connected, but \(selectedModel) was not listed by this server.",
                     systemImage: "exclamationmark.triangle",
-                    tint: DS.Colors.accentDeep
+                    tone: .warning
                 )
             }
         } else {
             statusLabel(
                 "Enter a server URL and refresh models to check connectivity.",
                 systemImage: "network",
-                tint: DS.Colors.textSecondary
+                tone: .neutral
             )
         }
     }
