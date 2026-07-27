@@ -761,6 +761,30 @@ final class AppState {
         status = .processing
         overlay.show(state: .processing)
 
+        let speechConfiguration = SpeechOutputConfiguration(settings: settings)
+        var pocketTextContinuation: AsyncStream<String>.Continuation?
+        var pocketSpeechTask: Task<Void, Error>?
+
+        func startPocketStreamingIfNeeded() {
+            guard speechConfiguration.model == .pocketTTS,
+                  pocketTextContinuation == nil else {
+                return
+            }
+            let playback = makePocketStreamingSpeech(
+                generation: generation,
+                configuration: speechConfiguration
+            )
+            pocketTextContinuation = playback.continuation
+            pocketSpeechTask = playback.task
+        }
+
+        if speechConfiguration.model == .pocketTTS,
+           !CodexToolIntent.matches(trimmedPrompt) {
+            // Prepare the model and voice session while the assistant is
+            // generating its first words instead of serializing both waits.
+            startPocketStreamingIfNeeded()
+        }
+
         do {
             var response = ""
             let eventStream = VoiceAgentService.streamEvents(
@@ -770,6 +794,13 @@ final class AppState {
             for try await event in eventStream {
                 switch event {
                 case .toolStatus(let toolStatus):
+                    if pocketTextContinuation != nil {
+                        pocketTextContinuation?.finish()
+                        pocketSpeechTask?.cancel()
+                        pocketTextContinuation = nil
+                        pocketSpeechTask = nil
+                        speechOutputService.stop()
+                    }
                     if generation == agentRequestGeneration {
                         await speakAgentToolStatus(
                             toolStatus.message,
@@ -777,41 +808,71 @@ final class AppState {
                         )
                     }
                     await toolStatus.didFinishSpeaking()
-                    guard !Task.isCancelled,
-                          generation == agentRequestGeneration else { return }
+                    try Task.checkCancellation()
+                    guard generation == agentRequestGeneration else {
+                        throw CancellationError()
+                    }
                 case .response(let partialResponse):
-                    guard generation == agentRequestGeneration else { return }
+                    guard generation == agentRequestGeneration else {
+                        throw CancellationError()
+                    }
                     response = partialResponse
                     lastAgentResponse = partialResponse
                     currentTranscript = partialResponse
+
+                    if speechConfiguration.model == .pocketTTS {
+                        startPocketStreamingIfNeeded()
+                        pocketTextContinuation?.yield(partialResponse)
+                    }
                 }
             }
             try Task.checkCancellation()
             guard generation == agentRequestGeneration else { return }
 
-            let playbackTimeline = SpokenResponsePlaybackTimeline(text: response)
-            do {
-                try await speechOutputService.speak(
-                    response,
-                    configuration: SpeechOutputConfiguration(settings: settings),
-                    onPlaybackProgress: { [weak self] progress in
-                        guard let self, generation == agentRequestGeneration else { return }
-                        overlay.show(
-                            state: .response(
-                                text: playbackTimeline.text(at: progress),
-                                isComplete: progress >= 1
-                            )
-                        )
+            if let pocketSpeechTask {
+                pocketTextContinuation?.finish()
+                pocketTextContinuation = nil
+                do {
+                    try await pocketSpeechTask.value
+                } catch {
+                    guard !Task.isCancelled,
+                          generation == agentRequestGeneration else {
+                        throw CancellationError()
                     }
-                )
-            } catch {
-                guard !Task.isCancelled, generation == agentRequestGeneration else { return }
-                lastAgentError = "The response was generated, but \(error.localizedDescription)"
-                overlay.show(state: .error)
+                    lastAgentError = "The response was generated, but \(error.localizedDescription)"
+                    overlay.show(state: .error)
+                }
+            } else {
+                let playbackTimeline = SpokenResponsePlaybackTimeline(text: response)
+                do {
+                    try await speechOutputService.speak(
+                        response,
+                        configuration: speechConfiguration,
+                        onPlaybackProgress: { [weak self] progress in
+                            guard let self, generation == agentRequestGeneration else { return }
+                            overlay.show(
+                                state: .response(
+                                    text: playbackTimeline.text(at: progress),
+                                    isComplete: progress >= 1
+                                )
+                            )
+                        }
+                    )
+                } catch {
+                    guard !Task.isCancelled, generation == agentRequestGeneration else { return }
+                    lastAgentError = "The response was generated, but \(error.localizedDescription)"
+                    overlay.show(state: .error)
+                }
             }
         } catch is CancellationError {
+            pocketTextContinuation?.finish()
+            pocketSpeechTask?.cancel()
+            speechOutputService.stop()
             return
         } catch {
+            pocketTextContinuation?.finish()
+            pocketSpeechTask?.cancel()
+            speechOutputService.stop()
             guard !Task.isCancelled, generation == agentRequestGeneration else { return }
 
             let errorMessage = error.localizedDescription
@@ -824,6 +885,41 @@ final class AppState {
         isAgentRequestInProgress = false
         overlay.hide(afterDelay: 0.6)
         status = .idle
+    }
+
+    private func makePocketStreamingSpeech(
+        generation: Int,
+        configuration: SpeechOutputConfiguration
+    ) -> (
+        continuation: AsyncStream<String>.Continuation,
+        task: Task<Void, Error>
+    ) {
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: String.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let task = Task<Void, Error> { @MainActor [weak self] in
+            guard let self else {
+                throw CancellationError()
+            }
+            try await speechOutputService.speakPocketStreamingText(
+                stream,
+                configuration: configuration,
+                onPlaybackText: { [weak self] text, isComplete in
+                    guard let self,
+                          generation == agentRequestGeneration else {
+                        return
+                    }
+                    overlay.show(
+                        state: .response(
+                            text: text,
+                            isComplete: isComplete
+                        )
+                    )
+                }
+            )
+        }
+        return (continuation, task)
     }
 
     private func speakAgentToolStatus(_ message: String, generation: Int) async {

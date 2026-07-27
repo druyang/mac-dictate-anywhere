@@ -462,6 +462,94 @@ final class VoiceAgentTests: XCTestCase {
         XCTAssertGreaterThan(punctuated, plain)
     }
 
+    func testPocketStreamingPhrasePreviewAdvancesWithPlayedAudio() {
+        let state = PocketStreamingPhrasePlaybackState()
+        let phrase = "The preview should follow each spoken word naturally."
+        let frameSamples = Int64(PocketTtsConstants.samplesPerFrame)
+
+        XCTAssertEqual(state.register(phrase), 0)
+        for _ in 0..<12 {
+            state.didSchedule(utteranceIndex: 0, sampleCount: frameSamples)
+        }
+        state.didFinishGeneration()
+
+        var latestText = state.playbackText(
+            utteranceIndex: 0,
+            sampleCount: frameSamples
+        )
+        XCTAssertNotNil(latestText)
+        XCTAssertNotEqual(latestText, phrase)
+
+        for _ in 1..<12 {
+            latestText = state.playbackText(
+                utteranceIndex: 0,
+                sampleCount: frameSamples
+            ) ?? latestText
+        }
+        XCTAssertEqual(latestText, phrase)
+    }
+
+    func testStreamingPhraseAccumulatorHoldsVeryShortFirstSentence() {
+        var accumulator = StreamingSpeechPhraseAccumulator()
+
+        XCTAssertEqual(accumulator.ingest("Yes."), [])
+        XCTAssertEqual(
+            accumulator.ingest(
+                "Yes. This second sentence is deliberately long enough to provide a natural and stable speaking boundary."
+            ),
+            [
+                "Yes. This second sentence is deliberately long enough to provide a natural and stable speaking boundary."
+            ]
+        )
+    }
+
+    func testStreamingPhraseAccumulatorStartsWithShortNaturalSentence() {
+        var accumulator = StreamingSpeechPhraseAccumulator()
+        let sentence = "Speaking can begin right away."
+
+        XCTAssertEqual(accumulator.ingest(sentence), [sentence])
+    }
+
+    func testStreamingPhraseAccumulatorEmitsOnlyNewCumulativeText() {
+        var accumulator = StreamingSpeechPhraseAccumulator()
+        let first =
+            "This complete opening sentence contains enough words to begin speaking naturally."
+        let second =
+            " The following complete sentence should be enqueued exactly once as well."
+
+        XCTAssertEqual(accumulator.ingest(first), [first])
+        XCTAssertEqual(accumulator.ingest(first), [])
+        XCTAssertEqual(accumulator.ingest(first + second), [
+            second.trimmingCharacters(in: .whitespaces)
+        ])
+        XCTAssertEqual(accumulator.finish(), [])
+    }
+
+    func testStreamingPhraseAccumulatorUsesLongClauseBoundary() {
+        var accumulator = StreamingSpeechPhraseAccumulator()
+        let text = """
+        This intentionally extended sentence keeps adding useful context so the accumulator has enough material to start speaking at a safe clause boundary, while the model continues generating the rest
+        """
+
+        XCTAssertEqual(
+            accumulator.ingest(text),
+            [
+                "This intentionally extended sentence keeps adding useful context so the accumulator has enough material to start speaking at a safe clause boundary,"
+            ]
+        )
+        XCTAssertEqual(
+            accumulator.finish(),
+            ["while the model continues generating the rest"]
+        )
+    }
+
+    func testStreamingPhraseAccumulatorFlushesShortFinalResponse() {
+        var accumulator = StreamingSpeechPhraseAccumulator()
+
+        XCTAssertEqual(accumulator.ingest("A final answer."), [])
+        XCTAssertEqual(accumulator.finish(), ["A final answer."])
+    }
+
     func testPocketTTSInstalledModelYieldsAudioBeforeSynthesisCompletes() async throws {
         guard ProcessInfo.processInfo.environment[
             "DICTATE_ANYWHERE_RUN_POCKET_STREAMING_INTEGRATION"
@@ -478,10 +566,13 @@ final class VoiceAgentTests: XCTestCase {
         try await manager.initialize()
 
         let startedAt = ContinuousClock.now
-        let stream = try await manager.synthesizeStreaming(
-            text: "Pocket TTS should begin speaking this response before every audio frame has finished generating."
+        let session = try await manager.makeSession(
+            voice: PocketTtsConstants.defaultVoice
         )
-        var iterator = stream.makeAsyncIterator()
+        session.enqueue(
+            "Pocket TTS should begin speaking this first phrase while more text is still arriving."
+        )
+        var iterator = session.frames.makeAsyncIterator()
         let firstFrame = try await iterator.next()
         let firstFrameLatency = ContinuousClock.now - startedAt
 
@@ -490,14 +581,24 @@ final class VoiceAgentTests: XCTestCase {
             PocketTtsConstants.samplesPerFrame
         )
 
+        session.enqueue(
+            "This second phrase arrived after the first audio frame and should continue in the same session."
+        )
+        session.finish()
+
         var frameCount = firstFrame == nil ? 0 : 1
+        var utteranceIndexes = Set(firstFrame?.utteranceIndex.map { [$0] } ?? [])
         while let frame = try await iterator.next() {
             XCTAssertEqual(frame.samples.count, PocketTtsConstants.samplesPerFrame)
+            if let utteranceIndex = frame.utteranceIndex {
+                utteranceIndexes.insert(utteranceIndex)
+            }
             frameCount += 1
         }
         let totalSynthesisTime = ContinuousClock.now - startedAt
 
         XCTAssertGreaterThan(frameCount, 1)
+        XCTAssertEqual(utteranceIndexes, [0, 1])
         XCTAssertLessThan(firstFrameLatency, totalSynthesisTime)
         XCTAssertGreaterThan(
             totalSynthesisTime - firstFrameLatency,

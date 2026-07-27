@@ -9,6 +9,17 @@ import AVFoundation
 import Foundation
 import FluidAudio
 
+private struct StreamingPlaybackTeardown: @unchecked Sendable {
+    let engine: AVAudioEngine?
+    let player: AVAudioPlayerNode?
+
+    func run() {
+        player?.stop()
+        engine?.stop()
+        engine?.reset()
+    }
+}
+
 struct SpeechOutputConfiguration: Sendable {
     let model: SpeechSynthesisModel
     let supertonicVoice: SupertonicVoiceChoice
@@ -47,7 +58,7 @@ struct SpeechOutputConfiguration: Sendable {
 
 @MainActor
 final class SpeechOutputService {
-    private static let pocketStreamingStartupFrameCount = 4
+    private static let pocketStreamingStartupFrameCount = 1
 
     private var supertonicManager: Supertonic3Manager?
     private var kokoroManager: KokoroAneManager?
@@ -55,7 +66,12 @@ final class SpeechOutputService {
     private var player: AVAudioPlayer?
     private var streamingEngine: AVAudioEngine?
     private var streamingPlayer: AVAudioPlayerNode?
+    private var pocketStreamingSession: PocketTtsSession?
     private var requestGeneration = 0
+    private let streamingTeardownQueue = DispatchQueue(
+        label: "com.dictate-anywhere.speech-output-teardown",
+        qos: .default
+    )
 
     func speak(
         _ text: String,
@@ -100,6 +116,122 @@ final class SpeechOutputService {
         )
     }
 
+    func speakPocketStreamingText(
+        _ cumulativeTextSnapshots: AsyncStream<String>,
+        configuration: SpeechOutputConfiguration,
+        onPlaybackText: @escaping (String, Bool) -> Void
+    ) async throws {
+        requestGeneration += 1
+        let generation = requestGeneration
+        stopPlayer()
+
+        guard configuration.model == .pocketTTS else {
+            throw SpeechPlaybackError.couldNotPrepare
+        }
+        guard SpeechModelManager.isDownloaded(.pocketTTS) else {
+            throw SpeechModelError.modelNotDownloaded(.pocketTTS)
+        }
+
+        let manager = try await pocketTtsManager(configuration: configuration)
+        try Task.checkCancellation()
+        guard generation == requestGeneration else {
+            throw CancellationError()
+        }
+
+        let session = try await manager.makeSession(
+            voice: configuration.pocketVoice.rawValue
+        )
+        try Task.checkCancellation()
+        guard generation == requestGeneration else {
+            await session.cancel()
+            throw CancellationError()
+        }
+        pocketStreamingSession = session
+
+        let phraseState = PocketStreamingPhrasePlaybackState()
+        let feederTask = Task { @MainActor in
+            var accumulator = StreamingSpeechPhraseAccumulator()
+            for await snapshot in cumulativeTextSnapshots {
+                guard !Task.isCancelled,
+                      generation == self.requestGeneration else {
+                    await session.cancel()
+                    return
+                }
+                let spokenSnapshot = SpokenResponseFormatter.plainText(from: snapshot)
+                for phrase in accumulator.ingest(spokenSnapshot) {
+                    let utteranceIndex = phraseState.register(phrase)
+                    precondition(
+                        utteranceIndex >= 0,
+                        "PocketTTS utterance indexes must be non-negative."
+                    )
+                    session.enqueue(phrase)
+                }
+            }
+
+            guard !Task.isCancelled,
+                  generation == self.requestGeneration else {
+                await session.cancel()
+                return
+            }
+            for phrase in accumulator.finish() {
+                _ = phraseState.register(phrase)
+                session.enqueue(phrase)
+            }
+            session.finish()
+        }
+
+        do {
+            try await playPocketFrames(
+                session.frames,
+                generation: generation,
+                estimatedTotalSamples: 0,
+                onProgress: nil,
+                onFrameScheduled: { frame in
+                    guard let utteranceIndex = frame.utteranceIndex else { return }
+                    phraseState.didSchedule(
+                        utteranceIndex: utteranceIndex,
+                        sampleCount: Int64(frame.samples.count)
+                    )
+                },
+                onFramePlayed: { [weak self] frame in
+                    guard let utteranceIndex = frame.utteranceIndex,
+                          let spokenText = phraseState.playbackText(
+                              utteranceIndex: utteranceIndex,
+                              sampleCount: Int64(frame.samples.count)
+                          ) else {
+                        return
+                    }
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              generation == self.requestGeneration else {
+                            return
+                        }
+                        onPlaybackText(spokenText, false)
+                    }
+                },
+                onSynthesisFinished: {
+                    phraseState.didFinishGeneration()
+                }
+            )
+            await feederTask.value
+            try Task.checkCancellation()
+            guard generation == requestGeneration else {
+                throw CancellationError()
+            }
+            onPlaybackText(phraseState.finalText, true)
+            if pocketStreamingSession === session {
+                pocketStreamingSession = nil
+            }
+        } catch {
+            feederTask.cancel()
+            await session.cancel()
+            if pocketStreamingSession === session {
+                pocketStreamingSession = nil
+            }
+            throw error
+        }
+    }
+
     func stop() {
         requestGeneration += 1
         stopPlayer()
@@ -108,11 +240,19 @@ final class SpeechOutputService {
     private func stopPlayer() {
         player?.stop()
         player = nil
-        streamingPlayer?.stop()
-        streamingEngine?.stop()
-        streamingEngine?.reset()
-        streamingPlayer = nil
+
+        let engine = streamingEngine
+        let streamingPlayer = streamingPlayer
+        self.streamingPlayer = nil
         streamingEngine = nil
+        enqueueStreamingTeardown(engine: engine, player: streamingPlayer)
+
+        if let pocketStreamingSession {
+            self.pocketStreamingSession = nil
+            Task {
+                await pocketStreamingSession.cancel()
+            }
+        }
     }
 
     func unload(_ model: SpeechSynthesisModel) async {
@@ -238,6 +378,32 @@ final class SpeechOutputService {
             text: text,
             voice: voice
         )
+        try await playPocketFrames(
+            stream,
+            generation: generation,
+            estimatedTotalSamples: PocketStreamingPlaybackProgress.estimatedTotalSamples(
+                for: text
+            ),
+            onProgress: onProgress,
+            onFrameScheduled: nil,
+            onFramePlayed: nil,
+            onSynthesisFinished: nil
+        )
+    }
+
+    private func playPocketFrames(
+        _ stream: AsyncThrowingStream<PocketTtsSynthesizer.AudioFrame, Error>,
+        generation: Int,
+        estimatedTotalSamples: Int64,
+        onProgress: ((Double) -> Void)?,
+        onFrameScheduled: (@Sendable (PocketTtsSynthesizer.AudioFrame) -> Void)?,
+        onFramePlayed: (@Sendable (PocketTtsSynthesizer.AudioFrame) -> Void)?,
+        onSynthesisFinished: (@Sendable () -> Void)?
+    ) async throws {
+        guard generation == requestGeneration else {
+            throw CancellationError()
+        }
+
         let engine = AVAudioEngine()
         let streamingPlayer = AVAudioPlayerNode()
         guard let format = AVAudioFormat(
@@ -262,9 +428,6 @@ final class SpeechOutputService {
         self.streamingPlayer = streamingPlayer
 
         let playbackState = PocketStreamingPlaybackState()
-        let estimatedTotalSamples = PocketStreamingPlaybackProgress.estimatedTotalSamples(
-            for: text
-        )
         onProgress?(0)
 
         let progressTask = Task { @MainActor [weak self] in
@@ -296,11 +459,13 @@ final class SpeechOutputService {
                 let buffer = try makePocketStreamingPCMBuffer(from: frame.samples)
                 let sampleCount = Int64(frame.samples.count)
                 playbackState.didSchedule(sampleCount: sampleCount)
+                onFrameScheduled?(frame)
                 streamingPlayer.scheduleBuffer(
                     buffer,
                     completionCallbackType: .dataPlayedBack
                 ) { _ in
                     playbackState.didPlay(sampleCount: sampleCount)
+                    onFramePlayed?(frame)
                 }
 
                 if !playbackStarted,
@@ -319,6 +484,7 @@ final class SpeechOutputService {
             }
 
             playbackState.didFinishSynthesis()
+            onSynthesisFinished?()
             if !playbackStarted {
                 streamingPlayer.play()
                 guard streamingPlayer.isPlaying else {
@@ -344,14 +510,26 @@ final class SpeechOutputService {
         engine: AVAudioEngine,
         player: AVAudioPlayerNode
     ) {
-        player.stop()
-        engine.stop()
-        engine.reset()
-        if streamingPlayer === player {
-            streamingPlayer = nil
-        }
-        if streamingEngine === engine {
-            streamingEngine = nil
+        guard streamingPlayer === player,
+              streamingEngine === engine else { return }
+
+        streamingPlayer = nil
+        streamingEngine = nil
+        enqueueStreamingTeardown(engine: engine, player: player)
+    }
+
+    private func enqueueStreamingTeardown(
+        engine: AVAudioEngine?,
+        player: AVAudioPlayerNode?
+    ) {
+        guard engine != nil || player != nil else { return }
+
+        // AVAudioPlayerNode.stop() can wait for AVFoundation's Default-QoS
+        // render thread. Keep that synchronous wait off the main actor and at
+        // the same QoS as the thread it may need to finish.
+        let teardown = StreamingPlaybackTeardown(engine: engine, player: player)
+        streamingTeardownQueue.async {
+            teardown.run()
         }
     }
 
@@ -490,7 +668,7 @@ final class PocketStreamingPlaybackState: @unchecked Sendable {
     }
 }
 
-enum PocketStreamingPlaybackProgress {
+nonisolated enum PocketStreamingPlaybackProgress {
     static func estimatedTotalSamples(for text: String) -> Int64 {
         let words = text.split(whereSeparator: \.isWhitespace)
         let sentencePauses = text.reduce(into: 0) { count, character in
@@ -513,7 +691,243 @@ enum PocketStreamingPlaybackProgress {
     }
 }
 
-struct SpokenResponsePlaybackTimeline: Equatable {
+nonisolated struct StreamingSpeechPhraseAccumulator {
+    private static let minimumFirstPhraseWords = 4
+    private static let minimumLaterPhraseWords = 10
+    private static let preferredClauseWords = 18
+    private static let maximumWords = 42
+    private static let abbreviations: Set<String> = [
+        "dr.", "e.g.", "etc.", "fig.", "i.e.", "mr.", "mrs.", "ms.", "no.",
+        "prof.", "sr.", "st.", "vs.",
+    ]
+
+    private var latestSnapshot = ""
+    private var committedPrefix = ""
+    private var emittedPhraseCount = 0
+
+    mutating func ingest(_ cumulativeText: String) -> [String] {
+        guard cumulativeText.hasPrefix(committedPrefix) else {
+            // Cumulative model snapshots should be append-only. If a provider
+            // briefly emits an older or rewritten snapshot, retain the already
+            // spoken prefix and wait for a compatible snapshot instead of
+            // repeating or contradicting speech.
+            return []
+        }
+
+        latestSnapshot = cumulativeText
+        return drain(flushRemainder: false)
+    }
+
+    mutating func finish() -> [String] {
+        drain(flushRemainder: true)
+    }
+
+    private mutating func drain(flushRemainder: Bool) -> [String] {
+        var phrases: [String] = []
+
+        while latestSnapshot.hasPrefix(committedPrefix) {
+            let remainder = String(latestSnapshot.dropFirst(committedPrefix.count))
+            let leadingWhitespaceCount = remainder.prefix(while: \.isWhitespace).count
+            if leadingWhitespaceCount > 0 {
+                committedPrefix = String(
+                    latestSnapshot.prefix(committedPrefix.count + leadingWhitespaceCount)
+                )
+                continue
+            }
+            guard !remainder.isEmpty else { break }
+
+            let minimumWords = emittedPhraseCount == 0
+                ? Self.minimumFirstPhraseWords
+                : Self.minimumLaterPhraseWords
+            let boundary = Self.safeBoundary(
+                in: remainder,
+                minimumWords: minimumWords
+            )
+            if boundary == nil, !flushRemainder {
+                break
+            }
+
+            let consumedCount = boundary ?? remainder.count
+            let phrase = String(remainder.prefix(consumedCount))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            committedPrefix = String(
+                latestSnapshot.prefix(committedPrefix.count + consumedCount)
+            )
+            if !phrase.isEmpty {
+                phrases.append(phrase)
+                emittedPhraseCount += 1
+            }
+        }
+
+        return phrases
+    }
+
+    private static func safeBoundary(
+        in text: String,
+        minimumWords: Int
+    ) -> Int? {
+        var wordCount = 0
+        var isInsideWord = false
+        var lastClauseBoundary: Int?
+        var lastWordBoundary: Int?
+
+        for index in text.indices {
+            let character = text[index]
+            let nextIndex = text.index(after: index)
+            let offsetAfterCharacter = text.distance(
+                from: text.startIndex,
+                to: nextIndex
+            )
+
+            if character.isWhitespace {
+                isInsideWord = false
+                lastWordBoundary = offsetAfterCharacter
+                continue
+            }
+            if !isInsideWord {
+                wordCount += 1
+                isInsideWord = true
+            }
+
+            if ",;:".contains(character),
+               isBoundaryFollowedByWhitespaceOrEnd(nextIndex, in: text) {
+                lastClauseBoundary = offsetAfterCharacter
+                if wordCount >= preferredClauseWords {
+                    return offsetAfterCharacter
+                }
+            }
+
+            if ".?!".contains(character),
+               isBoundaryFollowedByWhitespaceOrEnd(nextIndex, in: text),
+               !isFalsePeriodBoundary(at: index, in: text),
+               wordCount >= minimumWords {
+                return offsetAfterCharacter
+            }
+
+            if wordCount >= maximumWords {
+                return lastClauseBoundary ?? lastWordBoundary
+            }
+        }
+
+        return nil
+    }
+
+    private static func isBoundaryFollowedByWhitespaceOrEnd(
+        _ index: String.Index,
+        in text: String
+    ) -> Bool {
+        index == text.endIndex || text[index].isWhitespace
+    }
+
+    private static func isFalsePeriodBoundary(
+        at index: String.Index,
+        in text: String
+    ) -> Bool {
+        guard text[index] == "." else { return false }
+
+        let previousIndex = index > text.startIndex
+            ? text.index(before: index)
+            : nil
+        let nextIndex = text.index(after: index)
+        if let previousIndex,
+           text[previousIndex].isNumber,
+           nextIndex < text.endIndex,
+           text[nextIndex].isNumber {
+            return true
+        }
+
+        let prefix = text[...index].lowercased()
+        return abbreviations.contains {
+            prefix.hasSuffix($0)
+        }
+    }
+}
+
+nonisolated final class PocketStreamingPhrasePlaybackState: @unchecked Sendable {
+    private struct Phrase {
+        let precedingText: String
+        let timeline: SpokenResponsePlaybackTimeline
+        let estimatedSamples: Int64
+        var scheduledSamples: Int64 = 0
+        var playedSamples: Int64 = 0
+        var generationFinished = false
+        var lastProgress = 0.0
+    }
+
+    private let lock = NSLock()
+    private var cumulativeText = ""
+    private var phrases: [Int: Phrase] = [:]
+    private var lastPlaybackText = ""
+
+    func register(_ phrase: String) -> Int {
+        lock.withLock {
+            let precedingText = cumulativeText
+            if !cumulativeText.isEmpty {
+                cumulativeText += " "
+            }
+            cumulativeText += phrase
+            let index = phrases.count
+            phrases[index] = Phrase(
+                precedingText: precedingText,
+                timeline: SpokenResponsePlaybackTimeline(text: phrase),
+                estimatedSamples: PocketStreamingPlaybackProgress
+                    .estimatedTotalSamples(for: phrase)
+            )
+            return index
+        }
+    }
+
+    func didSchedule(utteranceIndex: Int, sampleCount: Int64) {
+        lock.withLock {
+            for earlierIndex in Array(phrases.keys)
+                where earlierIndex < utteranceIndex {
+                phrases[earlierIndex]?.generationFinished = true
+            }
+            phrases[utteranceIndex]?.scheduledSamples += sampleCount
+        }
+    }
+
+    func didFinishGeneration() {
+        lock.withLock {
+            for index in Array(phrases.keys) {
+                phrases[index]?.generationFinished = true
+            }
+        }
+    }
+
+    func playbackText(
+        utteranceIndex: Int,
+        sampleCount: Int64
+    ) -> String? {
+        lock.withLock {
+            guard var phrase = phrases[utteranceIndex] else { return nil }
+
+            phrase.playedSamples += sampleCount
+            let denominator = phrase.generationFinished
+                ? phrase.scheduledSamples
+                : max(phrase.estimatedSamples, phrase.scheduledSamples)
+            let measuredProgress = denominator > 0
+                ? min(Double(phrase.playedSamples) / Double(denominator), 1)
+                : 0
+            phrase.lastProgress = max(phrase.lastProgress, measuredProgress)
+            phrases[utteranceIndex] = phrase
+
+            let visiblePhrase = phrase.timeline.text(at: phrase.lastProgress)
+            let text = [phrase.precedingText, visiblePhrase]
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            guard text != lastPlaybackText else { return nil }
+            lastPlaybackText = text
+            return text
+        }
+    }
+
+    var finalText: String {
+        lock.withLock { cumulativeText }
+    }
+}
+
+nonisolated struct SpokenResponsePlaybackTimeline: Equatable, Sendable {
     private let words: [String]
     private let starts: [Double]
     private let totalWeight: Double
