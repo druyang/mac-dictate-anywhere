@@ -141,7 +141,7 @@ final class ComponentRenderTests: XCTestCase {
 
     func testNavItemRenders() {
         assertRenders(DSNavItem(title: "Speech Model", systemImage: "cpu", isSelected: true) {})
-        assertRenders(DSNavItem(title: "History", systemImage: "clock.arrow.circlepath", isSelected: false) {})
+        assertRenders(DSNavItem(title: "Dictation History", systemImage: "clock.arrow.circlepath", isSelected: false) {})
     }
 
     func testWaveformPillRenders() {

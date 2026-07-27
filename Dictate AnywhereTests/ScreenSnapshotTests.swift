@@ -49,6 +49,6 @@ final class ScreenSnapshotTests: XCTestCase {
     func testVoiceAssistantScreenRenders() { renderWindow(page: .voiceAssistant) }
     func testTextOverlayScreenRenders() { renderWindow(page: .textOverlay) }
     func testTranscriptCleanupScreenRenders() { renderWindow(page: .aiPostProcessing) }
-    func testHistoryScreenRenders() { renderWindow(page: .history) }
+    func testDictationHistoryScreenRenders() { renderWindow(page: .history) }
     func testAboutScreenRenders() { renderWindow(page: .about) }
 }

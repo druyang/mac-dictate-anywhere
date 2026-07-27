@@ -425,6 +425,42 @@ final class VoiceAgentTests: XCTestCase {
         XCTAssertEqual(buffer.floatChannelData?[0][2], samples[2])
     }
 
+    @MainActor
+    func testBufferedSpeechAudioDecodesIntoContinuousPlaybackSlices() throws {
+        let samples = (0..<5_000).map { index in
+            Float(index % 100) / 100
+        }
+        let wavData = try AudioWAV.data(
+            from: samples,
+            sampleRate: 24_000,
+            normalize: false
+        )
+
+        let decoded = try decodeSpeechAudioData(wavData)
+        let slices = try speechPCMBufferSlices(decoded)
+
+        XCTAssertEqual(decoded.format.sampleRate, 24_000)
+        XCTAssertEqual(decoded.format.channelCount, 1)
+        XCTAssertEqual(slices.count, 3)
+        XCTAssertEqual(
+            slices.reduce(0) { $0 + Int($1.frameLength) },
+            samples.count
+        )
+        XCTAssertEqual(slices[0].frameLength, 1_920)
+        XCTAssertEqual(slices[1].frameLength, 1_920)
+        XCTAssertEqual(slices[2].frameLength, 1_160)
+        XCTAssertEqual(
+            slices[0].floatChannelData?[0][99] ?? 0,
+            samples[99],
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            slices[2].floatChannelData?[0][0] ?? 0,
+            samples[3_840],
+            accuracy: 0.0001
+        )
+    }
+
     func testPocketStreamingPlaybackWaitsForAllScheduledAudio() {
         let state = PocketStreamingPlaybackState()
         let frameSamples = Int64(PocketTtsConstants.samplesPerFrame)
@@ -463,7 +499,7 @@ final class VoiceAgentTests: XCTestCase {
     }
 
     func testPocketStreamingPhrasePreviewAdvancesWithPlayedAudio() {
-        let state = PocketStreamingPhrasePlaybackState()
+        let state = StreamingPhrasePlaybackState()
         let phrase = "The preview should follow each spoken word naturally."
         let frameSamples = Int64(PocketTtsConstants.samplesPerFrame)
 
@@ -548,6 +584,44 @@ final class VoiceAgentTests: XCTestCase {
 
         XCTAssertEqual(accumulator.ingest("A final answer."), [])
         XCTAssertEqual(accumulator.finish(), ["A final answer."])
+    }
+
+    @MainActor
+    func testKokoroAneInstalledModelSynthesizesPhraseSizedBuffers() async throws {
+        guard ProcessInfo.processInfo.environment[
+            "DICTATE_ANYWHERE_RUN_BUFFERED_STREAMING_INTEGRATION"
+        ] == "1" else {
+            throw XCTSkip("Set the buffered-streaming integration flag to load KokoroAne.")
+        }
+
+        let manager = KokoroAneManager(
+            defaultVoice: KokoroAneConstants.defaultVoice
+        )
+        try await manager.initialize()
+
+        let firstStartedAt = ContinuousClock.now
+        let first = try await manager.synthesizeDetailed(
+            text: "The first phrase starts playing while the next phrase is synthesized."
+        )
+        let firstSynthesisTime = ContinuousClock.now - firstStartedAt
+
+        let secondStartedAt = ContinuousClock.now
+        let second = try await manager.synthesizeDetailed(
+            text: "The second phrase can then be scheduled directly behind it."
+        )
+        let secondSynthesisTime = ContinuousClock.now - secondStartedAt
+
+        XCTAssertFalse(first.samples.isEmpty)
+        XCTAssertFalse(second.samples.isEmpty)
+        XCTAssertEqual(first.sampleRate, second.sampleRate)
+        print(
+            "KokoroAne phrase timing:",
+            firstSynthesisTime,
+            secondSynthesisTime,
+            "audio:",
+            Double(first.samples.count) / Double(first.sampleRate),
+            Double(second.samples.count) / Double(second.sampleRate)
+        )
     }
 
     func testPocketTTSInstalledModelYieldsAudioBeforeSynthesisCompletes() async throws {

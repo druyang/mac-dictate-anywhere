@@ -205,37 +205,37 @@ final class DesignSystemTests: XCTestCase {
         XCTAssertEqual(bars.map(\.height), [8, 14, 20, 12, 24, 17, 10, 22, 15, 26, 12, 18, 9, 14])
     }
 
-    // MARK: - History filtering & date format
+    // MARK: - Dictation history filtering & date format
 
     private func entry(_ text: String) -> TranscriptHistoryEntry {
         TranscriptHistoryEntry(id: UUID(), text: text, createdAt: Date(timeIntervalSince1970: 1_800_000_000))
     }
 
-    func testHistoryFilterEmptyQueryReturnsAll() {
+    func testDictationHistoryFilterEmptyQueryReturnsAll() {
         let entries = [entry("alpha"), entry("beta")]
-        XCTAssertEqual(TranscriptHistoryView.filteredEntries(entries, searchText: "").count, 2)
-        XCTAssertEqual(TranscriptHistoryView.filteredEntries(entries, searchText: "   ").count, 2)
+        XCTAssertEqual(DictationHistoryView.filteredEntries(entries, searchText: "").count, 2)
+        XCTAssertEqual(DictationHistoryView.filteredEntries(entries, searchText: "   ").count, 2)
     }
 
-    func testHistoryFilterIsCaseInsensitive() {
+    func testDictationHistoryFilterIsCaseInsensitive() {
         let entries = [entry("Hello World"), entry("other")]
-        let filtered = TranscriptHistoryView.filteredEntries(entries, searchText: "hello")
+        let filtered = DictationHistoryView.filteredEntries(entries, searchText: "hello")
         XCTAssertEqual(filtered.map(\.text), ["Hello World"])
     }
 
-    func testHistoryFilterNoMatches() {
+    func testDictationHistoryFilterNoMatches() {
         let entries = [entry("alpha")]
-        XCTAssertTrue(TranscriptHistoryView.filteredEntries(entries, searchText: "zzz").isEmpty)
+        XCTAssertTrue(DictationHistoryView.filteredEntries(entries, searchText: "zzz").isEmpty)
     }
 
-    func testHistoryDateFormatMatchesDesign() {
+    func testDictationHistoryDateFormatMatchesDesign() {
         var components = DateComponents()
         components.year = 2026; components.month = 7; components.day = 15
         components.hour = 17; components.minute = 54
         let calendar = Calendar(identifier: .gregorian)
         let date = calendar.date(from: components)!
 
-        let formatter = TranscriptHistoryView.dateFormatter
+        let formatter = DictationHistoryView.dateFormatter
         let original = formatter.locale
         formatter.locale = Locale(identifier: "en_US_POSIX")
         defer { formatter.locale = original }

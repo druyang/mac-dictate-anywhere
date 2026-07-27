@@ -1375,7 +1375,9 @@ final class Settings {
         hotkeyBindings.removeAll { $0.id == id }
     }
 
-    func addTranscriptHistoryEntry(_ text: String) {
+    func addDictationHistoryEntry(_ text: String, for action: HotkeyAction) {
+        guard action == .dictate else { return }
+
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return }
 

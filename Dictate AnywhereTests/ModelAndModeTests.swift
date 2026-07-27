@@ -199,7 +199,7 @@ final class ModelAndModeTests: XCTestCase {
                 "Voice Assistant",
                 "Text & Overlay",
                 "Transcript Cleanup",
-                "History",
+                "Dictation History",
                 "About",
             ]
         )

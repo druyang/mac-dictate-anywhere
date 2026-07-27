@@ -20,6 +20,39 @@ private struct StreamingPlaybackTeardown: @unchecked Sendable {
     }
 }
 
+private struct IndexedStreamingSpeechPhrase: Sendable {
+    let index: Int
+    let text: String
+}
+
+private struct EncodedStreamingSpeechPhrase: Sendable {
+    let index: Int
+    let text: String
+    let audio: Data
+}
+
+private actor OrderedStreamingSpeechEmitter {
+    private let continuation:
+        AsyncThrowingStream<EncodedStreamingSpeechPhrase, Error>.Continuation
+    private var nextOutputIndex = 0
+    private var completed: [Int: EncodedStreamingSpeechPhrase] = [:]
+
+    init(
+        continuation:
+            AsyncThrowingStream<EncodedStreamingSpeechPhrase, Error>.Continuation
+    ) {
+        self.continuation = continuation
+    }
+
+    func submit(_ result: EncodedStreamingSpeechPhrase) {
+        completed[result.index] = result
+        while let ready = completed.removeValue(forKey: nextOutputIndex) {
+            continuation.yield(ready)
+            nextOutputIndex += 1
+        }
+    }
+}
+
 struct SpeechOutputConfiguration: Sendable {
     let model: SpeechSynthesisModel
     let supertonicVoice: SupertonicVoiceChoice
@@ -116,6 +149,26 @@ final class SpeechOutputService {
         )
     }
 
+    func speakStreamingText(
+        _ cumulativeTextSnapshots: AsyncStream<String>,
+        configuration: SpeechOutputConfiguration,
+        onPlaybackText: @escaping (String, Bool) -> Void
+    ) async throws {
+        if configuration.model == .pocketTTS {
+            try await speakPocketStreamingText(
+                cumulativeTextSnapshots,
+                configuration: configuration,
+                onPlaybackText: onPlaybackText
+            )
+        } else {
+            try await speakBufferedStreamingText(
+                cumulativeTextSnapshots,
+                configuration: configuration,
+                onPlaybackText: onPlaybackText
+            )
+        }
+    }
+
     func speakPocketStreamingText(
         _ cumulativeTextSnapshots: AsyncStream<String>,
         configuration: SpeechOutputConfiguration,
@@ -148,7 +201,7 @@ final class SpeechOutputService {
         }
         pocketStreamingSession = session
 
-        let phraseState = PocketStreamingPhrasePlaybackState()
+        let phraseState = StreamingPhrasePlaybackState()
         let feederTask = Task { @MainActor in
             var accumulator = StreamingSpeechPhraseAccumulator()
             for await snapshot in cumulativeTextSnapshots {
@@ -227,6 +280,312 @@ final class SpeechOutputService {
             await session.cancel()
             if pocketStreamingSession === session {
                 pocketStreamingSession = nil
+            }
+            throw error
+        }
+    }
+
+    private func speakBufferedStreamingText(
+        _ cumulativeTextSnapshots: AsyncStream<String>,
+        configuration: SpeechOutputConfiguration,
+        onPlaybackText: @escaping (String, Bool) -> Void
+    ) async throws {
+        requestGeneration += 1
+        let generation = requestGeneration
+        stopPlayer()
+
+        guard configuration.model != .pocketTTS else {
+            throw SpeechPlaybackError.couldNotPrepare
+        }
+        guard configuration.model == .openRouter
+            || SpeechModelManager.isDownloaded(configuration.model) else {
+            throw SpeechModelError.modelNotDownloaded(configuration.model)
+        }
+
+        let phrases = Self.streamingPhrases(from: cumulativeTextSnapshots)
+        let synthesizedPhrases = makeSynthesizedPhraseStream(
+            phrases,
+            configuration: configuration,
+            generation: generation
+        )
+        try await playBufferedPhrases(
+            synthesizedPhrases,
+            generation: generation,
+            onPlaybackText: onPlaybackText
+        )
+    }
+
+    private static func streamingPhrases(
+        from cumulativeTextSnapshots: AsyncStream<String>
+    ) -> AsyncStream<IndexedStreamingSpeechPhrase> {
+        AsyncStream { continuation in
+            let task = Task {
+                var accumulator = StreamingSpeechPhraseAccumulator()
+                var nextIndex = 0
+
+                for await snapshot in cumulativeTextSnapshots {
+                    try? Task.checkCancellation()
+                    guard !Task.isCancelled else { break }
+                    let spokenSnapshot = SpokenResponseFormatter.plainText(from: snapshot)
+                    for phrase in accumulator.ingest(spokenSnapshot) {
+                        continuation.yield(
+                            IndexedStreamingSpeechPhrase(
+                                index: nextIndex,
+                                text: phrase
+                            )
+                        )
+                        nextIndex += 1
+                    }
+                }
+
+                if !Task.isCancelled {
+                    for phrase in accumulator.finish() {
+                        continuation.yield(
+                            IndexedStreamingSpeechPhrase(
+                                index: nextIndex,
+                                text: phrase
+                            )
+                        )
+                        nextIndex += 1
+                    }
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    private func makeSynthesizedPhraseStream(
+        _ phrases: AsyncStream<IndexedStreamingSpeechPhrase>,
+        configuration: SpeechOutputConfiguration,
+        generation: Int
+    ) -> AsyncThrowingStream<EncodedStreamingSpeechPhrase, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task { @MainActor [weak self] in
+                guard let self else {
+                    continuation.finish(throwing: CancellationError())
+                    return
+                }
+
+                do {
+                    try await self.prepareForSynthesis(configuration: configuration)
+                    try Task.checkCancellation()
+                    guard generation == self.requestGeneration else {
+                        throw CancellationError()
+                    }
+
+                    let maximumConcurrentSynthesis = configuration.model == .openRouter
+                        ? 2
+                        : 1
+                    let orderedEmitter = OrderedStreamingSpeechEmitter(
+                        continuation: continuation
+                    )
+                    try await withThrowingTaskGroup(
+                        of: Void.self
+                    ) { group in
+                        var activeTasks = 0
+
+                        for await phrase in phrases {
+                            try Task.checkCancellation()
+                            guard generation == self.requestGeneration else {
+                                throw CancellationError()
+                            }
+
+                            group.addTask { [weak self] in
+                                guard let self else {
+                                    throw CancellationError()
+                                }
+                                let audio = try await self.synthesize(
+                                    phrase.text,
+                                    configuration: configuration
+                                )
+                                await orderedEmitter.submit(
+                                    EncodedStreamingSpeechPhrase(
+                                        index: phrase.index,
+                                        text: phrase.text,
+                                        audio: audio
+                                    )
+                                )
+                            }
+                            activeTasks += 1
+
+                            if activeTasks >= maximumConcurrentSynthesis {
+                                try await group.next()
+                                activeTasks -= 1
+                            }
+                        }
+
+                        while activeTasks > 0 {
+                            try await group.next()
+                            activeTasks -= 1
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    private func prepareForSynthesis(
+        configuration: SpeechOutputConfiguration
+    ) async throws {
+        switch configuration.model {
+        case .supertonic3:
+            if supertonicManager == nil {
+                let created = Supertonic3Manager()
+                try await created.initialize()
+                supertonicManager = created
+            }
+        case .kokoroAne:
+            if kokoroManager == nil {
+                let created = KokoroAneManager(
+                    defaultVoice: KokoroAneConstants.defaultVoice
+                )
+                try await created.initialize()
+                kokoroManager = created
+            }
+        case .pocketTTS:
+            _ = try await pocketTtsManager(configuration: configuration)
+        case .openRouter:
+            break
+        }
+    }
+
+    private func playBufferedPhrases(
+        _ phrases: AsyncThrowingStream<EncodedStreamingSpeechPhrase, Error>,
+        generation: Int,
+        onPlaybackText: @escaping (String, Bool) -> Void
+    ) async throws {
+        let playbackState = PocketStreamingPlaybackState()
+        let phraseState = StreamingPhrasePlaybackState()
+        var engine: AVAudioEngine?
+        var streamingPlayer: AVAudioPlayerNode?
+        var playbackFormat: AVAudioFormat?
+        var playbackStarted = false
+
+        let completionTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self,
+                      generation == self.requestGeneration else {
+                    return
+                }
+                if playbackState.snapshot(estimatedTotalSamples: 0).isComplete {
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+        }
+
+        do {
+            for try await phrase in phrases {
+                try Task.checkCancellation()
+                guard generation == requestGeneration else {
+                    throw CancellationError()
+                }
+
+                let buffer = try decodeSpeechAudioData(phrase.audio)
+                guard buffer.frameLength > 0 else {
+                    throw SpeechPlaybackError.couldNotPrepare
+                }
+
+                if engine == nil {
+                    let createdEngine = AVAudioEngine()
+                    let createdPlayer = AVAudioPlayerNode()
+                    createdEngine.attach(createdPlayer)
+                    createdEngine.connect(
+                        createdPlayer,
+                        to: createdEngine.mainMixerNode,
+                        format: buffer.format
+                    )
+                    createdEngine.prepare()
+                    do {
+                        try createdEngine.start()
+                    } catch {
+                        throw SpeechPlaybackError.couldNotStart
+                    }
+                    engine = createdEngine
+                    streamingPlayer = createdPlayer
+                    playbackFormat = buffer.format
+                    self.streamingEngine = createdEngine
+                    self.streamingPlayer = createdPlayer
+                }
+
+                guard let streamingPlayer,
+                      let playbackFormat,
+                      audioFormatsMatch(buffer.format, playbackFormat) else {
+                    throw SpeechPlaybackError.couldNotPrepare
+                }
+
+                let utteranceIndex = phraseState.register(phrase.text)
+                guard utteranceIndex == phrase.index else {
+                    throw SpeechPlaybackError.couldNotPrepare
+                }
+
+                for slice in try speechPCMBufferSlices(buffer) {
+                    let sampleCount = Int64(slice.frameLength)
+                    playbackState.didSchedule(sampleCount: sampleCount)
+                    phraseState.didSchedule(
+                        utteranceIndex: utteranceIndex,
+                        sampleCount: sampleCount
+                    )
+                    streamingPlayer.scheduleBuffer(
+                        slice,
+                        completionCallbackType: .dataPlayedBack
+                    ) { [weak self] _ in
+                        playbackState.didPlay(sampleCount: sampleCount)
+                        guard let spokenText = phraseState.playbackText(
+                            utteranceIndex: utteranceIndex,
+                            sampleCount: sampleCount
+                        ) else {
+                            return
+                        }
+                        Task { @MainActor [weak self] in
+                            guard let self,
+                                  generation == self.requestGeneration else {
+                                return
+                            }
+                            onPlaybackText(spokenText, false)
+                        }
+                    }
+                }
+                phraseState.didFinishGeneration(
+                    utteranceIndex: utteranceIndex
+                )
+
+                if !playbackStarted {
+                    streamingPlayer.play()
+                    guard streamingPlayer.isPlaying else {
+                        throw SpeechPlaybackError.couldNotStart
+                    }
+                    playbackStarted = true
+                }
+            }
+
+            guard let engine,
+                  let streamingPlayer,
+                  playbackState.hasScheduledAudio else {
+                throw SpeechPlaybackError.couldNotPrepare
+            }
+
+            playbackState.didFinishSynthesis()
+            await completionTask.value
+            try Task.checkCancellation()
+            guard generation == requestGeneration else {
+                throw CancellationError()
+            }
+            onPlaybackText(phraseState.finalText, true)
+            finishStreamingPlayback(engine: engine, player: streamingPlayer)
+        } catch {
+            completionTask.cancel()
+            if let engine, let streamingPlayer {
+                finishStreamingPlayback(engine: engine, player: streamingPlayer)
             }
             throw error
         }
@@ -605,6 +964,96 @@ func makePocketStreamingPCMBuffer(from samples: [Float]) throws -> AVAudioPCMBuf
     return buffer
 }
 
+@MainActor
+func decodeSpeechAudioData(_ data: Data) throws -> AVAudioPCMBuffer {
+    guard !data.isEmpty else {
+        throw SpeechPlaybackError.couldNotPrepare
+    }
+
+    let isWAV = data.count >= 4
+        && data.prefix(4).elementsEqual("RIFF".utf8)
+    let fileURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+        .appendingPathExtension(isWAV ? "wav" : "mp3")
+    try data.write(to: fileURL, options: .atomic)
+    defer {
+        try? FileManager.default.removeItem(at: fileURL)
+    }
+
+    let audioFile = try AVAudioFile(forReading: fileURL)
+    guard audioFile.length > 0,
+          audioFile.length <= Int64(UInt32.max),
+          let buffer = AVAudioPCMBuffer(
+              pcmFormat: audioFile.processingFormat,
+              frameCapacity: AVAudioFrameCount(audioFile.length)
+          ) else {
+        throw SpeechPlaybackError.couldNotPrepare
+    }
+    try audioFile.read(into: buffer)
+    guard buffer.frameLength > 0 else {
+        throw SpeechPlaybackError.couldNotPrepare
+    }
+    return buffer
+}
+
+@MainActor
+func speechPCMBufferSlices(
+    _ source: AVAudioPCMBuffer,
+    duration: TimeInterval = 0.08
+) throws -> [AVAudioPCMBuffer] {
+    let format = source.format
+    guard source.frameLength > 0,
+          duration > 0,
+          format.commonFormat == .pcmFormatFloat32,
+          !format.isInterleaved,
+          let sourceChannels = source.floatChannelData else {
+        throw SpeechPlaybackError.couldNotPrepare
+    }
+
+    let framesPerSlice = max(
+        1,
+        Int((format.sampleRate * duration).rounded())
+    )
+    let totalFrames = Int(source.frameLength)
+    let channelCount = Int(format.channelCount)
+    var slices: [AVAudioPCMBuffer] = []
+    slices.reserveCapacity(
+        Int(ceil(Double(totalFrames) / Double(framesPerSlice)))
+    )
+
+    var offset = 0
+    while offset < totalFrames {
+        let frameCount = min(framesPerSlice, totalFrames - offset)
+        guard let slice = AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: AVAudioFrameCount(frameCount)
+        ),
+        let destinationChannels = slice.floatChannelData else {
+            throw SpeechPlaybackError.couldNotPrepare
+        }
+        slice.frameLength = AVAudioFrameCount(frameCount)
+        for channel in 0..<channelCount {
+            destinationChannels[channel].update(
+                from: sourceChannels[channel].advanced(by: offset),
+                count: frameCount
+            )
+        }
+        slices.append(slice)
+        offset += frameCount
+    }
+    return slices
+}
+
+nonisolated func audioFormatsMatch(
+    _ lhs: AVAudioFormat,
+    _ rhs: AVAudioFormat
+) -> Bool {
+    lhs.commonFormat == rhs.commonFormat
+        && lhs.sampleRate == rhs.sampleRate
+        && lhs.channelCount == rhs.channelCount
+        && lhs.isInterleaved == rhs.isInterleaved
+}
+
 struct PocketStreamingPlaybackSnapshot: Equatable {
     let progress: Double
     let isComplete: Bool
@@ -843,7 +1292,7 @@ nonisolated struct StreamingSpeechPhraseAccumulator {
     }
 }
 
-nonisolated final class PocketStreamingPhrasePlaybackState: @unchecked Sendable {
+nonisolated final class StreamingPhrasePlaybackState: @unchecked Sendable {
     private struct Phrase {
         let precedingText: String
         let timeline: SpokenResponsePlaybackTimeline
@@ -892,6 +1341,12 @@ nonisolated final class PocketStreamingPhrasePlaybackState: @unchecked Sendable 
             for index in Array(phrases.keys) {
                 phrases[index]?.generationFinished = true
             }
+        }
+    }
+
+    func didFinishGeneration(utteranceIndex: Int) {
+        lock.withLock {
+            phrases[utteranceIndex]?.generationFinished = true
         }
     }
 

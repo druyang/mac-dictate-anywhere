@@ -120,14 +120,14 @@ final class SettingsLogicTests: XCTestCase {
         XCTAssertEqual(Settings.defaultFillerWords, ["um", "uh", "erm", "er", "hmm"])
     }
 
-    // MARK: - Transcript history
+    // MARK: - Dictation history
 
-    func testAddRemoveClearTranscriptHistory() {
+    func testAddRemoveClearDictationHistory() {
         let settings = Settings.shared
         settings.transcriptHistory = []
 
-        settings.addTranscriptHistoryEntry("first")
-        settings.addTranscriptHistoryEntry("second")
+        settings.addDictationHistoryEntry("first", for: .dictate)
+        settings.addDictationHistoryEntry("second", for: .dictate)
         XCTAssertEqual(settings.transcriptHistory.map(\.text), ["first", "second"])
 
         let id = settings.transcriptHistory[0].id
@@ -135,6 +135,15 @@ final class SettingsLogicTests: XCTestCase {
         XCTAssertEqual(settings.transcriptHistory.map(\.text), ["second"])
 
         settings.clearTranscriptHistory()
+        XCTAssertTrue(settings.transcriptHistory.isEmpty)
+    }
+
+    func testAskActionsAreExcludedFromDictationHistory() {
+        let settings = Settings.shared
+        settings.transcriptHistory = []
+
+        settings.addDictationHistoryEntry("What is the weather?", for: .ask)
+
         XCTAssertTrue(settings.transcriptHistory.isEmpty)
     }
 

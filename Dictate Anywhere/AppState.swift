@@ -559,7 +559,8 @@ final class AppState {
             currentTranscript = finalText
             lastTranscript = finalText
             Self.lastTranscriptForMenuBar = finalText
-            settings.addTranscriptHistoryEntry(finalText)
+            // Ask requests belong to assistant conversation memory, not
+            // Dictation History.
             insertionTargetApp = nil
             await restoreRecordingAudio()
             // Recording has fully stopped. The agent request owns its own
@@ -660,7 +661,7 @@ final class AppState {
         currentTranscript = processedText
         lastTranscript = processedText
         Self.lastTranscriptForMenuBar = processedText
-        settings.addTranscriptHistoryEntry(processedText)
+        settings.addDictationHistoryEntry(processedText, for: sessionAction)
 
         // Insert text
         NotificationCenter.default.post(name: .dismissMenusForPaste, object: nil)
@@ -762,27 +763,25 @@ final class AppState {
         overlay.show(state: .processing)
 
         let speechConfiguration = SpeechOutputConfiguration(settings: settings)
-        var pocketTextContinuation: AsyncStream<String>.Continuation?
-        var pocketSpeechTask: Task<Void, Error>?
+        var streamingTextContinuation: AsyncStream<String>.Continuation?
+        var streamingSpeechTask: Task<Void, Error>?
 
-        func startPocketStreamingIfNeeded() {
-            guard speechConfiguration.model == .pocketTTS,
-                  pocketTextContinuation == nil else {
+        func startStreamingSpeechIfNeeded() {
+            guard streamingTextContinuation == nil else {
                 return
             }
-            let playback = makePocketStreamingSpeech(
+            let playback = makeStreamingSpeech(
                 generation: generation,
                 configuration: speechConfiguration
             )
-            pocketTextContinuation = playback.continuation
-            pocketSpeechTask = playback.task
+            streamingTextContinuation = playback.continuation
+            streamingSpeechTask = playback.task
         }
 
-        if speechConfiguration.model == .pocketTTS,
-           !CodexToolIntent.matches(trimmedPrompt) {
+        if !CodexToolIntent.matches(trimmedPrompt) {
             // Prepare the model and voice session while the assistant is
             // generating its first words instead of serializing both waits.
-            startPocketStreamingIfNeeded()
+            startStreamingSpeechIfNeeded()
         }
 
         do {
@@ -794,11 +793,11 @@ final class AppState {
             for try await event in eventStream {
                 switch event {
                 case .toolStatus(let toolStatus):
-                    if pocketTextContinuation != nil {
-                        pocketTextContinuation?.finish()
-                        pocketSpeechTask?.cancel()
-                        pocketTextContinuation = nil
-                        pocketSpeechTask = nil
+                    if streamingTextContinuation != nil {
+                        streamingTextContinuation?.finish()
+                        streamingSpeechTask?.cancel()
+                        streamingTextContinuation = nil
+                        streamingSpeechTask = nil
                         speechOutputService.stop()
                     }
                     if generation == agentRequestGeneration {
@@ -820,20 +819,18 @@ final class AppState {
                     lastAgentResponse = partialResponse
                     currentTranscript = partialResponse
 
-                    if speechConfiguration.model == .pocketTTS {
-                        startPocketStreamingIfNeeded()
-                        pocketTextContinuation?.yield(partialResponse)
-                    }
+                    startStreamingSpeechIfNeeded()
+                    streamingTextContinuation?.yield(partialResponse)
                 }
             }
             try Task.checkCancellation()
             guard generation == agentRequestGeneration else { return }
 
-            if let pocketSpeechTask {
-                pocketTextContinuation?.finish()
-                pocketTextContinuation = nil
+            if let streamingSpeechTask {
+                streamingTextContinuation?.finish()
+                streamingTextContinuation = nil
                 do {
-                    try await pocketSpeechTask.value
+                    try await streamingSpeechTask.value
                 } catch {
                     guard !Task.isCancelled,
                           generation == agentRequestGeneration else {
@@ -865,13 +862,13 @@ final class AppState {
                 }
             }
         } catch is CancellationError {
-            pocketTextContinuation?.finish()
-            pocketSpeechTask?.cancel()
+            streamingTextContinuation?.finish()
+            streamingSpeechTask?.cancel()
             speechOutputService.stop()
             return
         } catch {
-            pocketTextContinuation?.finish()
-            pocketSpeechTask?.cancel()
+            streamingTextContinuation?.finish()
+            streamingSpeechTask?.cancel()
             speechOutputService.stop()
             guard !Task.isCancelled, generation == agentRequestGeneration else { return }
 
@@ -887,7 +884,7 @@ final class AppState {
         status = .idle
     }
 
-    private func makePocketStreamingSpeech(
+    private func makeStreamingSpeech(
         generation: Int,
         configuration: SpeechOutputConfiguration
     ) -> (
@@ -902,7 +899,7 @@ final class AppState {
             guard let self else {
                 throw CancellationError()
             }
-            try await speechOutputService.speakPocketStreamingText(
+            try await speechOutputService.speakStreamingText(
                 stream,
                 configuration: configuration,
                 onPlaybackText: { [weak self] text, isComplete in

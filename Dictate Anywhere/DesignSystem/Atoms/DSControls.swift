@@ -148,7 +148,7 @@ struct DSDropdownLabel: View {
     }
 }
 
-/// Atom: bordered search field (History page).
+/// Atom: bordered search field (Dictation History page).
 struct DSSearchField: View {
     let placeholder: String
     @Binding var text: String

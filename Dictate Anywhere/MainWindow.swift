@@ -44,7 +44,7 @@ enum SidebarPage: String, CaseIterable, Identifiable {
         case .voiceAssistant: return "Voice Assistant"
         case .textOverlay: return "Text & Overlay"
         case .aiPostProcessing: return "Transcript Cleanup"
-        case .history: return "History"
+        case .history: return "Dictation History"
         case .about: return "About"
         }
     }
@@ -176,7 +176,7 @@ struct MainWindow: View {
         case .aiPostProcessing:
             AIPostProcessingView()
         case .history:
-            TranscriptHistoryView()
+            DictationHistoryView()
         case .about:
             AboutView()
         }

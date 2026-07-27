@@ -1,14 +1,14 @@
 //
-//  TranscriptHistoryView.swift
+//  DictationHistoryView.swift
 //  Dictate Anywhere
 //
-//  "History" page: local transcript history.
+//  "Dictation History" page: local dictation transcript history.
 //
 
 import AppKit
 import SwiftUI
 
-struct TranscriptHistoryView: View {
+struct DictationHistoryView: View {
     @Environment(AppState.self) private var appState
 
     @State private var searchText = ""
@@ -39,7 +39,7 @@ struct TranscriptHistoryView: View {
 
         DSPage(spacing: 20) {
             DSSectionHeader(
-                title: "History",
+                title: "Dictation History",
                 subtitle: "Everything you've dictated, stored privately on this Mac."
             )
 
@@ -76,7 +76,7 @@ struct TranscriptHistoryView: View {
                         if index > 0 {
                             DSDivider()
                         }
-                        TranscriptHistoryRow(
+                        DictationHistoryRow(
                             entry: entry,
                             onCopy: { copyToPasteboard(entry.text) },
                             onDelete: { settings.removeTranscriptHistoryEntry(id: entry.id) }
@@ -85,13 +85,13 @@ struct TranscriptHistoryView: View {
                 }
             }
         }
-        .alert("Clear all transcripts?", isPresented: $showClearAllConfirm) {
+        .alert("Clear dictation history?", isPresented: $showClearAllConfirm) {
             Button("Clear All", role: .destructive) {
                 settings.clearTranscriptHistory()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This will permanently remove every transcript stored on this Mac.")
+            Text("This will permanently remove every dictation transcript stored on this Mac.")
         }
     }
 
@@ -101,7 +101,7 @@ struct TranscriptHistoryView: View {
     }
 }
 
-private struct TranscriptHistoryRow: View {
+private struct DictationHistoryRow: View {
     let entry: TranscriptHistoryEntry
     let onCopy: () -> Void
     let onDelete: () -> Void
@@ -109,7 +109,7 @@ private struct TranscriptHistoryRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 16) {
             VStack(alignment: .leading, spacing: 5) {
-                Text(TranscriptHistoryView.dateFormatter.string(from: entry.createdAt))
+                Text(DictationHistoryView.dateFormatter.string(from: entry.createdAt))
                     .font(DS.Fonts.ui(11.5, .semibold))
                     .tracking(0.2)
                     .foregroundStyle(DS.Colors.textSecondary)
