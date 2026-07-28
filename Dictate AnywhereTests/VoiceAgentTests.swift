@@ -1,5 +1,6 @@
 import AVFoundation
 import FluidAudio
+import FoundationModels
 import XCTest
 @testable import Dictate_Anywhere_Dev
 
@@ -11,7 +12,54 @@ private actor VoiceAgentTestFlag {
     }
 }
 
+private actor OpenRouterSpeechRetryTestHarness {
+    private let successOnRequest: Int?
+    private(set) var requestCount = 0
+    private(set) var sleepDelays: [TimeInterval] = []
+
+    init(successOnRequest: Int? = 2) {
+        self.successOnRequest = successOnRequest
+    }
+
+    func load(_ request: URLRequest) throws -> (Data, URLResponse) {
+        requestCount += 1
+        let succeeded = requestCount == successOnRequest
+        let status = succeeded ? 200 : 429
+        let headers = succeeded ? [:] : ["Retry-After": "3"]
+        let response = try XCTUnwrap(
+            HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: status,
+                httpVersion: "HTTP/2",
+                headerFields: headers
+            )
+        )
+        let data = succeeded
+            ? Data([0x01, 0x02, 0x03])
+            : Data(#"{"error":{"message":"Provider returned 429"}}"#.utf8)
+        return (data, response)
+    }
+
+    func recordSleep(_ delay: TimeInterval) {
+        sleepDelays.append(delay)
+    }
+}
+
 final class VoiceAgentTests: XCTestCase {
+    private func conversationExchange(
+        user: String = "What is my favorite editor?",
+        assistant: String = "Your favorite editor is Xcode."
+    ) -> VoiceConversationExchange {
+        VoiceConversationExchange(
+            id: UUID(),
+            userMessage: user,
+            assistantMessage: assistant,
+            createdAt: Date(timeIntervalSince1970: 1_800_000_000),
+            provider: .appleIntelligence,
+            model: "system-language-model"
+        )
+    }
+
     func testCodexIntentRequiresWholeWordMention() {
         XCTAssertTrue(CodexToolIntent.matches("Ask Codex what this project does."))
         XCTAssertTrue(CodexToolIntent.matches("Can you check this with codex?"))
@@ -305,6 +353,58 @@ final class VoiceAgentTests: XCTestCase {
         XCTAssertNil(payload["max_tool_calls"])
     }
 
+    func testOpenRouterConversationHistoryUsesAlternatingMessageRoles() throws {
+        let history = VoiceConversationContext.messages(from: [conversationExchange()])
+        let request = try OpenRouterPostProcessingService.makeStreamingAnswerRequest(
+            text: "What about my IDE?",
+            model: "openai/gpt-5-mini",
+            instructions: "Answer clearly.",
+            history: history,
+            webSearchEnabled: false,
+            apiKey: "sk-or-test"
+        )
+
+        let body = try XCTUnwrap(request.httpBody)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: body) as? [String: Any]
+        )
+        let messages = try XCTUnwrap(payload["messages"] as? [[String: String]])
+        XCTAssertEqual(messages.map { $0["role"] }, [
+            "system",
+            "user",
+            "assistant",
+            "user",
+        ])
+        XCTAssertEqual(messages[1]["content"], "What is my favorite editor?")
+        XCTAssertEqual(messages[2]["content"], "Your favorite editor is Xcode.")
+        XCTAssertEqual(messages[3]["content"], "What about my IDE?")
+    }
+
+    func testOllamaConversationHistoryUsesChatEndpointAndRoles() throws {
+        let history = VoiceConversationContext.messages(from: [conversationExchange()])
+        let request = try OllamaPostProcessingService.makeStreamingChatRequest(
+            text: "What about my IDE?",
+            baseURL: "http://127.0.0.1:11434",
+            model: "gemma4:e4b",
+            instructions: "Answer clearly.",
+            history: history
+        )
+
+        XCTAssertEqual(request.url?.path, "/api/chat")
+        let body = try XCTUnwrap(request.httpBody)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: body) as? [String: Any]
+        )
+        let messages = try XCTUnwrap(payload["messages"] as? [[String: String]])
+        XCTAssertEqual(messages.map { $0["role"] }, [
+            "system",
+            "user",
+            "assistant",
+            "user",
+        ])
+        XCTAssertEqual(messages.last?["content"], "What about my IDE?")
+    }
+
     func testCodexRequestIncludesCustomSystemPromptWithoutWeakeningReadOnlyRules() {
         let prompt = CodexToolService.requestPrompt(
             userPrompt: "Summarize this project.",
@@ -315,6 +415,42 @@ final class VoiceAgentTests: XCTestCase {
         XCTAssertTrue(prompt.contains("when they do not conflict with these read-only restrictions"))
         XCTAssertTrue(prompt.contains("Answer like a patient teacher."))
         XCTAssertTrue(prompt.contains("Summarize this project."))
+    }
+
+    func testCodexRequestIncludesOnlyExplicitlyProvidedProjectHistory() {
+        let prompt = CodexToolService.requestPrompt(
+            userPrompt: "What about its tests?",
+            systemPrompt: "Be direct.",
+            conversationHistory: [
+                conversationExchange(
+                    user: "What does this project do?",
+                    assistant: "It is a dictation app."
+                )
+            ]
+        )
+
+        XCTAssertTrue(prompt.contains("Previous completed exchanges for this same selected project"))
+        XCTAssertTrue(prompt.contains("User: What does this project do?"))
+        XCTAssertTrue(prompt.contains("Assistant: It is a dictation app."))
+        XCTAssertTrue(prompt.contains("Current user request:\nWhat about its tests?"))
+    }
+
+    func testAppleTranscriptReplaysConversationRolesWhenAvailable() throws {
+        guard #available(macOS 26, *) else {
+            throw XCTSkip("Foundation Models transcripts require macOS 26.")
+        }
+        let history = VoiceConversationContext.messages(from: [conversationExchange()])
+
+        let transcript = VoiceAgentService.appleTranscript(
+            systemPrompt: "Answer clearly.",
+            history: history
+        )
+
+        XCTAssertEqual(transcript.count, 3)
+        let transcriptDescription = transcript.map(\.description).joined(separator: "\n")
+        XCTAssertTrue(transcriptDescription.contains("Answer clearly."))
+        XCTAssertTrue(transcriptDescription.contains("What is my favorite editor?"))
+        XCTAssertTrue(transcriptDescription.contains("Your favorite editor is Xcode."))
     }
 
     @MainActor
@@ -334,6 +470,75 @@ final class VoiceAgentTests: XCTestCase {
         let timeline = SpokenResponsePlaybackTimeline(text: "One response.")
         XCTAssertEqual(timeline.text(at: -1), "")
         XCTAssertEqual(timeline.text(at: 2), "One response.")
+    }
+
+    func testReadAloudProgressUsesSpokenWordsAndCompletesExactly() {
+        let total = "One two three four five six seven eight."
+
+        XCTAssertEqual(
+            ReadAloudPlaybackProgress.fraction(
+                playedText: "One two three four",
+                totalText: total,
+                isComplete: false
+            ),
+            0.5,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            ReadAloudPlaybackProgress.fraction(
+                playedText: total,
+                totalText: total,
+                isComplete: true
+            ),
+            1
+        )
+    }
+
+    func testReadAloudResumeContinuesAfterLastPlayedWord() {
+        let total = "One two three. Four five six. Seven eight."
+
+        XCTAssertEqual(
+            ReadAloudPlaybackProgress.remainingText(
+                in: total,
+                afterPlayedWordCount: 4
+            ),
+            "five six. Seven eight."
+        )
+        XCTAssertEqual(
+            ReadAloudPlaybackProgress.remainingText(
+                in: total,
+                afterPlayedWordCount: 0
+            ),
+            total
+        )
+        XCTAssertEqual(
+            ReadAloudPlaybackProgress.remainingText(
+                in: total,
+                afterPlayedWordCount: 20
+            ),
+            ""
+        )
+    }
+
+    @MainActor
+    func testReadAloudPauseAndStopStateTransitions() {
+        let appState = AppState()
+        appState.isReadAloudInProgress = true
+        appState.isSpeechOutputInProgress = true
+        appState.status = .processing
+
+        appState.pauseReadAloud()
+
+        XCTAssertFalse(appState.isReadAloudInProgress)
+        XCTAssertTrue(appState.isReadAloudPaused)
+        XCTAssertFalse(appState.isSpeechOutputInProgress)
+        XCTAssertEqual(appState.status, .idle)
+
+        appState.stopReadAloud()
+
+        XCTAssertFalse(appState.isReadAloudInProgress)
+        XCTAssertFalse(appState.isReadAloudPaused)
+        XCTAssertEqual(appState.status, .idle)
     }
 
     func testOpenRouterSpeechCatalogDecodesModelsAndVoices() throws {
@@ -391,6 +596,72 @@ final class VoiceAgentTests: XCTestCase {
         XCTAssertEqual(payload["model"] as? String, "qwen/qwen-audio-3.0-tts-flash")
         XCTAssertEqual(payload["voice"] as? String, "loongjohn")
         XCTAssertEqual(payload["response_format"] as? String, "mp3")
+    }
+
+    func testOpenRouterSpeechRetries429AndHonorsRetryAfter() async throws {
+        let harness = OpenRouterSpeechRetryTestHarness()
+
+        let audio = try await OpenRouterSpeechService.synthesize(
+            text: "Hello world.",
+            model: "microsoft/mai-voice-2",
+            voice: "en-US-Harper:MAI-Voice-2",
+            apiKey: "sk-or-test",
+            apiKeyEnvironmentVariable: "",
+            dataLoader: { request in
+                try await harness.load(request)
+            },
+            sleep: { delay in
+                await harness.recordSleep(delay)
+            }
+        )
+
+        let requestCount = await harness.requestCount
+        let sleepDelays = await harness.sleepDelays
+        XCTAssertEqual(audio, Data([0x01, 0x02, 0x03]))
+        XCTAssertEqual(requestCount, 2)
+        XCTAssertEqual(sleepDelays, [3])
+    }
+
+    func testOpenRouterSpeechUsesSingleFallbackDelayWithoutHeader() {
+        XCTAssertEqual(
+            OpenRouterSpeechService.retryDelay(
+                retryAfterHeader: nil
+            ),
+            2
+        )
+    }
+
+    func testOpenRouterSpeechStopsAfterBounded429Retries() async {
+        let harness = OpenRouterSpeechRetryTestHarness(successOnRequest: nil)
+
+        do {
+            _ = try await OpenRouterSpeechService.synthesize(
+                text: "Hello world.",
+                model: "microsoft/mai-voice-2",
+                voice: "en-US-Harper:MAI-Voice-2",
+                apiKey: "sk-or-test",
+                apiKeyEnvironmentVariable: "",
+                dataLoader: { request in
+                    try await harness.load(request)
+                },
+                sleep: { delay in
+                    await harness.recordSleep(delay)
+                }
+            )
+            XCTFail("Expected a bounded rate-limit error.")
+        } catch let error as OpenRouterSpeechService.ServiceError {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "The speech provider is rate-limited. Try again in 3 seconds or choose another speech model."
+            )
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let requestCount = await harness.requestCount
+        let sleepDelays = await harness.sleepDelays
+        XCTAssertEqual(requestCount, 2)
+        XCTAssertEqual(sleepDelays, [3])
     }
 
     func testOpenRouterSpeechRequiresModelAndVoice() {
@@ -584,6 +855,63 @@ final class VoiceAgentTests: XCTestCase {
 
         XCTAssertEqual(accumulator.ingest("A final answer."), [])
         XCTAssertEqual(accumulator.finish(), ["A final answer."])
+    }
+
+    func testStreamingPhraseAccumulatorAcceptsCompletePastedDocuments() {
+        var accumulator = StreamingSpeechPhraseAccumulator()
+        let text = [
+            "This opening sentence contains enough words to start the pasted document naturally.",
+            "The middle sentence provides another complete semantic boundary for continuous speech playback.",
+            "This final sentence confirms that every part of the pasted text remains in order.",
+        ].joined(separator: " ")
+
+        let phrases = accumulator.ingest(text) + accumulator.finish()
+
+        XCTAssertGreaterThan(phrases.count, 1)
+        XCTAssertEqual(phrases.joined(separator: " "), text)
+    }
+
+    func testOpenRouterSpeechChunksKeepFastStartAndBatchRemainingText() {
+        var accumulator = OpenRouterSpeechChunkAccumulator()
+        let sourcePhrases = (1...12).map { index in
+            "Sentence \(index) contains enough descriptive words to represent a natural speech synthesis boundary."
+        }
+        var chunks: [String] = []
+        for phrase in sourcePhrases {
+            chunks.append(contentsOf: accumulator.ingest(phrase))
+        }
+        chunks.append(contentsOf: accumulator.finish())
+
+        XCTAssertEqual(chunks[0], sourcePhrases[0])
+        XCTAssertEqual(chunks[1], sourcePhrases[1])
+        XCTAssertLessThanOrEqual(chunks.count, 4)
+        XCTAssertEqual(
+            chunks.joined(separator: " "),
+            sourcePhrases.joined(separator: " ")
+        )
+    }
+
+    func testStreamingSynthesisLookaheadWaitsForPlaybackRelease() async throws {
+        let gate = StreamingSynthesisLookaheadGate(
+            maximumOutstandingChunks: 2
+        )
+        let thirdAcquireCompleted = VoiceAgentTestFlag()
+        try await gate.acquire()
+        try await gate.acquire()
+
+        let waitingTask = Task {
+            try await gate.acquire()
+            await thirdAcquireCompleted.set()
+        }
+        try await Task.sleep(for: .milliseconds(60))
+        let completedBeforeRelease = await thirdAcquireCompleted.value
+        XCTAssertFalse(completedBeforeRelease)
+
+        await gate.release()
+        try await Task.sleep(for: .milliseconds(60))
+        let completedAfterRelease = await thirdAcquireCompleted.value
+        XCTAssertTrue(completedAfterRelease)
+        waitingTask.cancel()
     }
 
     @MainActor

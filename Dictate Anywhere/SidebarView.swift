@@ -55,9 +55,15 @@ struct SidebarView: View {
     private var statusText: String {
         switch appState.status {
         case .idle:
+            if appState.isReadAloudPaused {
+                return "Read aloud paused"
+            }
             return appState.activeEngine.isReady ? "Ready to dictate" : "Model not set up"
         case .recording: return "Listening…"
         case .processing:
+            if appState.isReadAloudInProgress {
+                return "Reading text…"
+            }
             if appState.isAgentRequestInProgress {
                 return "Thinking and speaking…"
             }
@@ -72,6 +78,9 @@ struct SidebarView: View {
     private var statusColor: Color {
         switch appState.status {
         case .idle:
+            if appState.isReadAloudPaused {
+                return DS.Tone.info.icon
+            }
             return appState.activeEngine.isReady ? DS.Tone.success.icon : DS.Tone.neutral.icon
         case .recording, .processing: return DS.Tone.info.icon
         case .error: return DS.Tone.danger.icon

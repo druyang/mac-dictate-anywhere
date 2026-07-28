@@ -35,6 +35,7 @@ A native macOS app for voice dictation anywhere. Press and hold Fn (or a custom 
 - **Ollama Integration** - Connect to a local or remote Ollama server, refresh installed models, and manage recommended local models from the app
 - **OpenRouter Integration** - Use hosted models through OpenRouter with model search, structured-output-aware selection, and secure API key storage
 - **Optional Transcript Cleanup** - Post-process the final transcript with Apple Intelligence, Ollama, or OpenRouter for punctuation, grammar, formatting, and wording cleanup
+- **Conversation Memory** - Optionally retain 5–100 completed exchanges locally for conversational follow-up questions, review them on a dedicated screen, and delete individual memories; project-specific Codex memory stays separate
 - **Safe Fallbacks** - If AI cleanup fails or returns unusable output, the original local transcript is pasted instead
 - **Menu Bar App** - Runs quietly in your menu bar
 
@@ -243,8 +244,10 @@ The app uses FluidAudio speech models that run entirely on your Mac. Parakeet TD
 ## Privacy
 
 - **100% On-Device Speech Recognition** - All audio transcription happens locally on your Mac
-- **Ollama Can Stay Fully Local** - If you use a local Ollama server, transcript cleanup can stay on your machine; if you use a remote Ollama server, only transcript text is sent there
-- **Optional Cloud Transcript Cleanup** - Audio never leaves your Mac, but transcript text can be sent to OpenRouter if you enable hosted post-processing
+- **Optional Local Conversation Memory** - Completed Voice Assistant exchanges are stored in Application Support only when conversation memory is enabled; the oldest exchanges are deleted automatically at the selected cap
+- **Ollama Can Stay Fully Local** - If you use a local Ollama server, transcript cleanup and assistant requests can stay on your machine; a remote Ollama server receives the current request and any conversation memory included with it
+- **Optional Cloud Processing** - Audio never leaves your Mac, but transcript text, assistant requests, and enabled conversation memory can be sent to OpenRouter
+- **Project Memory Isolation** - Read-only Codex exchanges are stored separately for each selected project and are never included in general assistant provider requests
 - **Secure OpenRouter Key Storage** - API keys pasted into the app are stored in Keychain
 - **No Analytics** - No tracking or telemetry (optional anonymous usage stats only)
 - **Clipboard Only** - Text insertion uses the clipboard + Cmd+V simulation

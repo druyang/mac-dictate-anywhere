@@ -163,4 +163,19 @@ final class ComponentRenderTests: XCTestCase {
     func testWarningBannerRenders() {
         assertRenders(WarningBanner(message: "A speech model is required.", buttonTitle: "Set Up") {})
     }
+
+    func testConversationMemoryRowRenders() {
+        let entry = VoiceConversationMemoryEntry(
+            exchange: VoiceConversationExchange(
+                id: UUID(),
+                userMessage: "What should I work on next?",
+                assistantMessage: "Start with the conversation-memory screen.",
+                createdAt: Date(timeIntervalSince1970: 1_800_000_000),
+                provider: .appleIntelligence,
+                model: "system-language-model"
+            ),
+            scope: .general
+        )
+        assertRenders(ConversationMemoryRow(entry: entry, onDelete: {}), width: 720)
+    }
 }

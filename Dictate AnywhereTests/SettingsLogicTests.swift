@@ -13,11 +13,14 @@ final class SettingsLogicTests: XCTestCase {
     private var savedAgentBrain: AgentBrainProvider = .appleIntelligence
     private var savedAgentSystemPrompt = ""
     private var savedAgentOpenRouterWebSearchEnabled = false
+    private var savedAgentConversationMemoryEnabled = false
+    private var savedAgentMemoryExchangeLimit = Settings.defaultAgentMemoryExchangeLimit
     private var savedCodexToolEnabled = false
     private var savedCodexWorkspacePath = ""
     private var savedSpeechModel: SpeechSynthesisModel = .supertonic3
     private var savedSupertonicVoice: SupertonicVoiceChoice = .m1
     private var savedPocketVoice: PocketVoiceChoice = .alba
+    private var savedStyleTTS2ReferenceAudioPath = ""
     private var savedSpeechLanguage: SpeechOutputLanguage = .english
     private var savedOpenRouterSpeechModel = ""
     private var savedOpenRouterSpeechVoice = ""
@@ -33,11 +36,14 @@ final class SettingsLogicTests: XCTestCase {
         savedAgentBrain = settings.agentBrainProvider
         savedAgentSystemPrompt = settings.agentSystemPrompt
         savedAgentOpenRouterWebSearchEnabled = settings.agentOpenRouterWebSearchEnabled
+        savedAgentConversationMemoryEnabled = settings.agentConversationMemoryEnabled
+        savedAgentMemoryExchangeLimit = settings.agentMemoryExchangeLimit
         savedCodexToolEnabled = settings.codexToolEnabled
         savedCodexWorkspacePath = settings.codexWorkspacePath
         savedSpeechModel = settings.speechSynthesisModel
         savedSupertonicVoice = settings.supertonicVoice
         savedPocketVoice = settings.pocketVoice
+        savedStyleTTS2ReferenceAudioPath = settings.styleTTS2ReferenceAudioPath
         savedSpeechLanguage = settings.speechOutputLanguage
         savedOpenRouterSpeechModel = settings.openRouterSpeechModel
         savedOpenRouterSpeechVoice = settings.openRouterSpeechVoice
@@ -53,11 +59,14 @@ final class SettingsLogicTests: XCTestCase {
         settings.agentBrainProvider = savedAgentBrain
         settings.agentSystemPrompt = savedAgentSystemPrompt
         settings.agentOpenRouterWebSearchEnabled = savedAgentOpenRouterWebSearchEnabled
+        settings.agentConversationMemoryEnabled = savedAgentConversationMemoryEnabled
+        settings.agentMemoryExchangeLimit = savedAgentMemoryExchangeLimit
         settings.codexToolEnabled = savedCodexToolEnabled
         settings.codexWorkspacePath = savedCodexWorkspacePath
         settings.speechSynthesisModel = savedSpeechModel
         settings.supertonicVoice = savedSupertonicVoice
         settings.pocketVoice = savedPocketVoice
+        settings.styleTTS2ReferenceAudioPath = savedStyleTTS2ReferenceAudioPath
         settings.speechOutputLanguage = savedSpeechLanguage
         settings.openRouterSpeechModel = savedOpenRouterSpeechModel
         settings.openRouterSpeechVoice = savedOpenRouterSpeechVoice
@@ -261,6 +270,24 @@ final class SettingsLogicTests: XCTestCase {
         XCTAssertTrue(configuration.openRouterWebSearchEnabled)
     }
 
+    func testConversationMemorySettingsClampToSupportedRange() {
+        let settings = Settings.shared
+
+        settings.agentConversationMemoryEnabled = true
+        settings.agentMemoryExchangeLimit = 2
+        XCTAssertTrue(settings.agentConversationMemoryEnabled)
+        XCTAssertEqual(
+            settings.agentMemoryExchangeLimit,
+            Settings.agentMemoryExchangeLimitRange.lowerBound
+        )
+
+        settings.agentMemoryExchangeLimit = 200
+        XCTAssertEqual(
+            settings.agentMemoryExchangeLimit,
+            Settings.agentMemoryExchangeLimitRange.upperBound
+        )
+    }
+
     func testSpeechOutputSettingsCanBeChangedIndependently() {
         let settings = Settings.shared
         settings.agentBrainProvider = .appleIntelligence
@@ -269,11 +296,16 @@ final class SettingsLogicTests: XCTestCase {
         settings.speechSynthesisModel = .pocketTTS
         settings.supertonicVoice = .f3
         settings.pocketVoice = .javert
+        settings.styleTTS2ReferenceAudioPath = "/tmp/styletts2-reference.wav"
         settings.speechOutputLanguage = .french
 
         XCTAssertEqual(settings.speechSynthesisModel, .pocketTTS)
         XCTAssertEqual(settings.supertonicVoice, .f3)
         XCTAssertEqual(settings.pocketVoice, .javert)
+        XCTAssertEqual(
+            settings.styleTTS2ReferenceAudioPath,
+            "/tmp/styletts2-reference.wav"
+        )
         XCTAssertEqual(settings.speechOutputLanguage, .french)
         XCTAssertEqual(settings.agentBrainProvider, .appleIntelligence)
         XCTAssertEqual(settings.transcriptPostProcessingMode, .none)
@@ -293,6 +325,36 @@ final class SettingsLogicTests: XCTestCase {
         XCTAssertEqual(
             configuration.openRouterAPIKeyEnvironmentVariable,
             settings.openRouterAPIKeyEnvironmentVariable
+        )
+    }
+
+    func testStyleTTS2ConfigurationRequiresAnExistingReferenceFile() throws {
+        let referenceURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("styletts2-reference-\(UUID().uuidString).wav")
+        XCTAssertTrue(
+            FileManager.default.createFile(
+                atPath: referenceURL.path,
+                contents: Data()
+            )
+        )
+        defer {
+            try? FileManager.default.removeItem(at: referenceURL)
+        }
+
+        let settings = Settings.shared
+        settings.speechSynthesisModel = .styleTTS2
+        settings.styleTTS2ReferenceAudioPath = referenceURL.path
+
+        let configuration = SpeechOutputConfiguration(settings: settings)
+        XCTAssertEqual(configuration.model, .styleTTS2)
+        XCTAssertEqual(configuration.styleTTS2ReferenceAudioURL, referenceURL)
+
+        settings.styleTTS2ReferenceAudioPath = referenceURL
+            .appendingPathExtension("missing")
+            .path
+        XCTAssertNil(
+            SpeechOutputConfiguration(settings: settings)
+                .styleTTS2ReferenceAudioURL
         )
     }
 }

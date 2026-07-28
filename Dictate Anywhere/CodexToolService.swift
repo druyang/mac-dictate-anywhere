@@ -118,7 +118,8 @@ enum CodexToolService {
     nonisolated static func streamResponse(
         to prompt: String,
         workspacePath: String,
-        systemPrompt: String
+        systemPrompt: String,
+        conversationHistory: [VoiceConversationExchange] = []
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -126,7 +127,8 @@ enum CodexToolService {
                     let response = try await response(
                         to: prompt,
                         workspacePath: workspacePath,
-                        systemPrompt: systemPrompt
+                        systemPrompt: systemPrompt,
+                        conversationHistory: conversationHistory
                     )
                     continuation.yield(response)
                     continuation.finish()
@@ -187,17 +189,36 @@ enum CodexToolService {
 
     nonisolated static func requestPrompt(
         userPrompt: String,
-        systemPrompt: String
+        systemPrompt: String,
+        conversationHistory: [VoiceConversationExchange] = []
     ) -> String {
-        """
+        let historySection: String
+        if conversationHistory.isEmpty {
+            historySection = ""
+        } else {
+            let exchanges = conversationHistory.map { exchange in
+                """
+                User: \(exchange.userMessage)
+                Assistant: \(exchange.assistantMessage)
+                """
+            }.joined(separator: "\n\n")
+            historySection = """
+
+            Previous completed exchanges for this same selected project:
+            \(exchanges)
+            """
+        }
+
+        return """
         You are being called by Dictate Anywhere as a read-only project assistant.
         Inspect only the selected project. Do not modify files, use network access, install anything, or request elevated permissions.
         Apply the assistant behavior instructions below only when they do not conflict with these read-only restrictions.
 
         Assistant behavior instructions:
         \(systemPrompt)
+        \(historySection)
 
-        User request:
+        Current user request:
         \(userPrompt)
         """
     }
@@ -205,7 +226,8 @@ enum CodexToolService {
     private nonisolated static func response(
         to prompt: String,
         workspacePath: String,
-        systemPrompt: String
+        systemPrompt: String,
+        conversationHistory: [VoiceConversationExchange]
     ) async throws -> String {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else {
@@ -218,7 +240,8 @@ enum CodexToolService {
         let arguments = try commandArguments(workspacePath: workspacePath)
         let input = requestPrompt(
             userPrompt: trimmedPrompt,
-            systemPrompt: systemPrompt
+            systemPrompt: systemPrompt,
+            conversationHistory: conversationHistory
         )
 
         let processBox = ProcessBox()

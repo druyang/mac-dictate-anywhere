@@ -31,25 +31,24 @@ private struct EncodedStreamingSpeechPhrase: Sendable {
     let audio: Data
 }
 
-private actor OrderedStreamingSpeechEmitter {
-    private let continuation:
-        AsyncThrowingStream<EncodedStreamingSpeechPhrase, Error>.Continuation
-    private var nextOutputIndex = 0
-    private var completed: [Int: EncodedStreamingSpeechPhrase] = [:]
+actor StreamingSynthesisLookaheadGate {
+    private let maximumOutstandingChunks: Int
+    private var outstandingChunks = 0
 
-    init(
-        continuation:
-            AsyncThrowingStream<EncodedStreamingSpeechPhrase, Error>.Continuation
-    ) {
-        self.continuation = continuation
+    init(maximumOutstandingChunks: Int) {
+        self.maximumOutstandingChunks = max(maximumOutstandingChunks, 1)
     }
 
-    func submit(_ result: EncodedStreamingSpeechPhrase) {
-        completed[result.index] = result
-        while let ready = completed.removeValue(forKey: nextOutputIndex) {
-            continuation.yield(ready)
-            nextOutputIndex += 1
+    func acquire() async throws {
+        while outstandingChunks >= maximumOutstandingChunks {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(20))
         }
+        outstandingChunks += 1
+    }
+
+    func release() {
+        outstandingChunks = max(outstandingChunks - 1, 0)
     }
 }
 
@@ -57,6 +56,7 @@ struct SpeechOutputConfiguration: Sendable {
     let model: SpeechSynthesisModel
     let supertonicVoice: SupertonicVoiceChoice
     let pocketVoice: PocketVoiceChoice
+    let styleTTS2ReferenceAudioPath: String
     let language: SpeechOutputLanguage
     let openRouterModel: String
     let openRouterVoice: String
@@ -67,6 +67,7 @@ struct SpeechOutputConfiguration: Sendable {
         model = settings.speechSynthesisModel
         supertonicVoice = settings.supertonicVoice
         pocketVoice = settings.pocketVoice
+        styleTTS2ReferenceAudioPath = settings.styleTTS2ReferenceAudioPath
         language = settings.speechOutputLanguage
         openRouterModel = settings.openRouterSpeechModel
         openRouterVoice = settings.openRouterSpeechVoice
@@ -83,9 +84,23 @@ struct SpeechOutputConfiguration: Sendable {
                 apiKey: openRouterAPIKey,
                 apiKeyEnvironmentVariable: openRouterAPIKeyEnvironmentVariable
             )
+        case .styleTTS2:
+            return SpeechModelManager.isDownloaded(model)
+                && styleTTS2ReferenceAudioURL != nil
         case .supertonic3, .kokoroAne, .pocketTTS:
             return SpeechModelManager.isDownloaded(model)
         }
+    }
+
+    var styleTTS2ReferenceAudioURL: URL? {
+        let trimmedPath = styleTTS2ReferenceAudioPath.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !trimmedPath.isEmpty,
+              FileManager.default.fileExists(atPath: trimmedPath) else {
+            return nil
+        }
+        return URL(fileURLWithPath: trimmedPath)
     }
 }
 
@@ -96,9 +111,11 @@ final class SpeechOutputService {
     private var supertonicManager: Supertonic3Manager?
     private var kokoroManager: KokoroAneManager?
     private var pocketManager: PocketTtsManager?
+    private var styleTTS2Manager: StyleTTS2Manager?
     private var player: AVAudioPlayer?
     private var streamingEngine: AVAudioEngine?
     private var streamingPlayer: AVAudioPlayerNode?
+    private var streamingSynthesisTask: Task<Void, Never>?
     private var pocketStreamingSession: PocketTtsSession?
     private var requestGeneration = 0
     private let streamingTeardownQueue = DispatchQueue(
@@ -302,25 +319,35 @@ final class SpeechOutputService {
             throw SpeechModelError.modelNotDownloaded(configuration.model)
         }
 
-        let phrases = Self.streamingPhrases(from: cumulativeTextSnapshots)
+        let phrases = Self.streamingPhrases(
+            from: cumulativeTextSnapshots,
+            coalesceForOpenRouter: configuration.model == .openRouter
+        )
+        let lookaheadGate = configuration.model == .openRouter
+            ? StreamingSynthesisLookaheadGate(maximumOutstandingChunks: 2)
+            : nil
         let synthesizedPhrases = makeSynthesizedPhraseStream(
             phrases,
             configuration: configuration,
-            generation: generation
+            generation: generation,
+            lookaheadGate: lookaheadGate
         )
         try await playBufferedPhrases(
             synthesizedPhrases,
             generation: generation,
+            lookaheadGate: lookaheadGate,
             onPlaybackText: onPlaybackText
         )
     }
 
     private static func streamingPhrases(
-        from cumulativeTextSnapshots: AsyncStream<String>
+        from cumulativeTextSnapshots: AsyncStream<String>,
+        coalesceForOpenRouter: Bool
     ) -> AsyncStream<IndexedStreamingSpeechPhrase> {
         AsyncStream { continuation in
             let task = Task {
                 var accumulator = StreamingSpeechPhraseAccumulator()
+                var openRouterAccumulator = OpenRouterSpeechChunkAccumulator()
                 var nextIndex = 0
 
                 for await snapshot in cumulativeTextSnapshots {
@@ -328,25 +355,46 @@ final class SpeechOutputService {
                     guard !Task.isCancelled else { break }
                     let spokenSnapshot = SpokenResponseFormatter.plainText(from: snapshot)
                     for phrase in accumulator.ingest(spokenSnapshot) {
-                        continuation.yield(
-                            IndexedStreamingSpeechPhrase(
-                                index: nextIndex,
-                                text: phrase
+                        let chunks = coalesceForOpenRouter
+                            ? openRouterAccumulator.ingest(phrase)
+                            : [phrase]
+                        for chunk in chunks {
+                            continuation.yield(
+                                IndexedStreamingSpeechPhrase(
+                                    index: nextIndex,
+                                    text: chunk
+                                )
                             )
-                        )
-                        nextIndex += 1
+                            nextIndex += 1
+                        }
                     }
                 }
 
                 if !Task.isCancelled {
                     for phrase in accumulator.finish() {
-                        continuation.yield(
-                            IndexedStreamingSpeechPhrase(
-                                index: nextIndex,
-                                text: phrase
+                        let chunks = coalesceForOpenRouter
+                            ? openRouterAccumulator.ingest(phrase)
+                            : [phrase]
+                        for chunk in chunks {
+                            continuation.yield(
+                                IndexedStreamingSpeechPhrase(
+                                    index: nextIndex,
+                                    text: chunk
+                                )
                             )
-                        )
-                        nextIndex += 1
+                            nextIndex += 1
+                        }
+                    }
+                    if coalesceForOpenRouter {
+                        for chunk in openRouterAccumulator.finish() {
+                            continuation.yield(
+                                IndexedStreamingSpeechPhrase(
+                                    index: nextIndex,
+                                    text: chunk
+                                )
+                            )
+                            nextIndex += 1
+                        }
                     }
                 }
                 continuation.finish()
@@ -360,13 +408,20 @@ final class SpeechOutputService {
     private func makeSynthesizedPhraseStream(
         _ phrases: AsyncStream<IndexedStreamingSpeechPhrase>,
         configuration: SpeechOutputConfiguration,
-        generation: Int
+        generation: Int,
+        lookaheadGate: StreamingSynthesisLookaheadGate?
     ) -> AsyncThrowingStream<EncodedStreamingSpeechPhrase, Error> {
         AsyncThrowingStream { continuation in
+            streamingSynthesisTask?.cancel()
             let task = Task { @MainActor [weak self] in
                 guard let self else {
                     continuation.finish(throwing: CancellationError())
                     return
+                }
+                defer {
+                    if generation == self.requestGeneration {
+                        self.streamingSynthesisTask = nil
+                    }
                 }
 
                 do {
@@ -376,57 +431,30 @@ final class SpeechOutputService {
                         throw CancellationError()
                     }
 
-                    let maximumConcurrentSynthesis = configuration.model == .openRouter
-                        ? 2
-                        : 1
-                    let orderedEmitter = OrderedStreamingSpeechEmitter(
-                        continuation: continuation
-                    )
-                    try await withThrowingTaskGroup(
-                        of: Void.self
-                    ) { group in
-                        var activeTasks = 0
-
-                        for await phrase in phrases {
-                            try Task.checkCancellation()
-                            guard generation == self.requestGeneration else {
-                                throw CancellationError()
-                            }
-
-                            group.addTask { [weak self] in
-                                guard let self else {
-                                    throw CancellationError()
-                                }
-                                let audio = try await self.synthesize(
-                                    phrase.text,
-                                    configuration: configuration
-                                )
-                                await orderedEmitter.submit(
-                                    EncodedStreamingSpeechPhrase(
-                                        index: phrase.index,
-                                        text: phrase.text,
-                                        audio: audio
-                                    )
-                                )
-                            }
-                            activeTasks += 1
-
-                            if activeTasks >= maximumConcurrentSynthesis {
-                                try await group.next()
-                                activeTasks -= 1
-                            }
+                    for await phrase in phrases {
+                        try Task.checkCancellation()
+                        guard generation == self.requestGeneration else {
+                            throw CancellationError()
                         }
-
-                        while activeTasks > 0 {
-                            try await group.next()
-                            activeTasks -= 1
-                        }
+                        try await lookaheadGate?.acquire()
+                        let audio = try await self.synthesize(
+                            phrase.text,
+                            configuration: configuration
+                        )
+                        continuation.yield(
+                            EncodedStreamingSpeechPhrase(
+                                index: phrase.index,
+                                text: phrase.text,
+                                audio: audio
+                            )
+                        )
                     }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
+            streamingSynthesisTask = task
             continuation.onTermination = { _ in
                 task.cancel()
             }
@@ -453,6 +481,8 @@ final class SpeechOutputService {
             }
         case .pocketTTS:
             _ = try await pocketTtsManager(configuration: configuration)
+        case .styleTTS2:
+            _ = try await styleTTS2ManagerInstance()
         case .openRouter:
             break
         }
@@ -461,6 +491,7 @@ final class SpeechOutputService {
     private func playBufferedPhrases(
         _ phrases: AsyncThrowingStream<EncodedStreamingSpeechPhrase, Error>,
         generation: Int,
+        lookaheadGate: StreamingSynthesisLookaheadGate?,
         onPlaybackText: @escaping (String, Bool) -> Void
     ) async throws {
         let playbackState = PocketStreamingPlaybackState()
@@ -528,8 +559,10 @@ final class SpeechOutputService {
                     throw SpeechPlaybackError.couldNotPrepare
                 }
 
-                for slice in try speechPCMBufferSlices(buffer) {
+                let slices = try speechPCMBufferSlices(buffer)
+                for (sliceIndex, slice) in slices.enumerated() {
                     let sampleCount = Int64(slice.frameLength)
+                    let isLastSlice = sliceIndex == slices.indices.last
                     playbackState.didSchedule(sampleCount: sampleCount)
                     phraseState.didSchedule(
                         utteranceIndex: utteranceIndex,
@@ -540,6 +573,11 @@ final class SpeechOutputService {
                         completionCallbackType: .dataPlayedBack
                     ) { [weak self] _ in
                         playbackState.didPlay(sampleCount: sampleCount)
+                        if isLastSlice, let lookaheadGate {
+                            Task {
+                                await lookaheadGate.release()
+                            }
+                        }
                         guard let spokenText = phraseState.playbackText(
                             utteranceIndex: utteranceIndex,
                             sampleCount: sampleCount
@@ -597,6 +635,9 @@ final class SpeechOutputService {
     }
 
     private func stopPlayer() {
+        streamingSynthesisTask?.cancel()
+        streamingSynthesisTask = nil
+
         player?.stop()
         player = nil
 
@@ -632,6 +673,11 @@ final class SpeechOutputService {
                 await pocketManager.cleanup()
             }
             pocketManager = nil
+        case .styleTTS2:
+            if let styleTTS2Manager {
+                await styleTTS2Manager.cleanup()
+            }
+            styleTTS2Manager = nil
         case .openRouter:
             break
         }
@@ -641,6 +687,7 @@ final class SpeechOutputService {
         _ text: String,
         configuration: SpeechOutputConfiguration
     ) async throws -> Data {
+        try Task.checkCancellation()
         switch configuration.model {
         case .supertonic3:
             let manager: Supertonic3Manager
@@ -693,6 +740,26 @@ final class SpeechOutputService {
             )
             return result.audio
 
+        case .styleTTS2:
+            guard let referenceAudioURL = configuration.styleTTS2ReferenceAudioURL else {
+                throw SpeechModelError.missingStyleTTS2ReferenceAudio
+            }
+            let manager = try await styleTTS2ManagerInstance()
+            let preparedReferenceAudioURL =
+                try prepareStyleTTS2ReferenceAudio(from: referenceAudioURL)
+            defer {
+                try? FileManager.default.removeItem(at: preparedReferenceAudioURL)
+            }
+            let samples = try await manager.synthesize(
+                text: text,
+                referenceAudioURL: preparedReferenceAudioURL
+            )
+            return try AudioWAV.data(
+                from: samples,
+                sampleRate: Double(StyleTTS2Constants.sampleRate),
+                normalize: false
+            )
+
         case .openRouter:
             return try await OpenRouterSpeechService.synthesize(
                 text: text,
@@ -719,6 +786,17 @@ final class SpeechOutputService {
         )
         try await created.initialize()
         pocketManager = created
+        return created
+    }
+
+    private func styleTTS2ManagerInstance() async throws -> StyleTTS2Manager {
+        if let styleTTS2Manager {
+            return styleTTS2Manager
+        }
+
+        let created = StyleTTS2Manager()
+        try await created.initialize()
+        styleTTS2Manager = created
         return created
     }
 
@@ -996,6 +1074,141 @@ func decodeSpeechAudioData(_ data: Data) throws -> AVAudioPCMBuffer {
     return buffer
 }
 
+/// FluidAudio 0.15.5's StyleTTS2 reference encoder has a fixed 231-frame mel
+/// input. Feed it an exact-length 24 kHz mono WAV so longer user recordings do
+/// not fail with a Core ML shape mismatch.
+func prepareStyleTTS2ReferenceAudio(from sourceURL: URL) throws -> URL {
+    let sourceFile = try AVAudioFile(forReading: sourceURL)
+    guard sourceFile.length > 0,
+          sourceFile.length <= Int64(UInt32.max),
+          let sourceBuffer = AVAudioPCMBuffer(
+              pcmFormat: sourceFile.processingFormat,
+              frameCapacity: AVAudioFrameCount(sourceFile.length)
+          ),
+          let targetFormat = AVAudioFormat(
+              commonFormat: .pcmFormatFloat32,
+              sampleRate: Double(StyleTTS2Constants.sampleRate),
+              channels: 1,
+              interleaved: false
+          ) else {
+        throw SpeechPlaybackError.couldNotPrepare
+    }
+    try sourceFile.read(into: sourceBuffer)
+    guard sourceBuffer.frameLength > 0,
+          let converter = AVAudioConverter(
+              from: sourceBuffer.format,
+              to: targetFormat
+          ) else {
+        throw SpeechPlaybackError.couldNotPrepare
+    }
+
+    let sampleRateRatio =
+        targetFormat.sampleRate / sourceBuffer.format.sampleRate
+    let outputCapacity = AVAudioFrameCount(
+        ceil(Double(sourceBuffer.frameLength) * sampleRateRatio) + 32
+    )
+    guard let convertedBuffer = AVAudioPCMBuffer(
+        pcmFormat: targetFormat,
+        frameCapacity: outputCapacity
+    ) else {
+        throw SpeechPlaybackError.couldNotPrepare
+    }
+
+    var suppliedInput = false
+    var conversionError: NSError?
+    let status = converter.convert(
+        to: convertedBuffer,
+        error: &conversionError
+    ) { _, inputStatus in
+        if suppliedInput {
+            inputStatus.pointee = .endOfStream
+            return nil
+        }
+        suppliedInput = true
+        inputStatus.pointee = .haveData
+        return sourceBuffer
+    }
+    guard status != .error,
+          conversionError == nil,
+          convertedBuffer.frameLength > 0,
+          let channelData = convertedBuffer.floatChannelData else {
+        throw conversionError ?? SpeechPlaybackError.couldNotPrepare
+    }
+
+    let convertedSamples = Array(
+        UnsafeBufferPointer(
+            start: channelData[0],
+            count: Int(convertedBuffer.frameLength)
+        )
+    )
+    let normalizedSamples = normalizedStyleTTS2ReferenceSamples(
+        convertedSamples
+    )
+    let wavData = try AudioWAV.data(
+        from: normalizedSamples,
+        sampleRate: Double(StyleTTS2Constants.sampleRate),
+        normalize: false
+    )
+    let outputURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("styletts2-reference-\(UUID().uuidString)")
+        .appendingPathExtension("wav")
+    try wavData.write(to: outputURL, options: .atomic)
+    return outputURL
+}
+
+func normalizedStyleTTS2ReferenceSamples(_ samples: [Float]) -> [Float] {
+    let requiredMelFrames = 231
+    let targetCount =
+        (requiredMelFrames - 1) * StyleTTS2Constants.melHopLength
+    guard !samples.isEmpty else {
+        return [Float](repeating: 0, count: targetCount)
+    }
+
+    let peak = samples.reduce(Float.zero) {
+        max($0, abs($1))
+    }
+    let silenceThreshold = max(peak * 0.02, 0.0005)
+    let firstSpeech = samples.firstIndex {
+        abs($0) >= silenceThreshold
+    } ?? samples.startIndex
+    let lastSpeech = samples.lastIndex {
+        abs($0) >= silenceThreshold
+    } ?? samples.index(before: samples.endIndex)
+    let margin = StyleTTS2Constants.sampleRate / 10
+    let speechStart = max(samples.startIndex, firstSpeech - margin)
+    let speechEnd = min(samples.endIndex, lastSpeech + margin + 1)
+    let speechSamples = Array(samples[speechStart..<speechEnd])
+
+    if speechSamples.count == targetCount {
+        return speechSamples
+    }
+    if speechSamples.count < targetCount {
+        let leadingPadding = (targetCount - speechSamples.count) / 2
+        var result = [Float](repeating: 0, count: targetCount)
+        result.replaceSubrange(
+            leadingPadding..<(leadingPadding + speechSamples.count),
+            with: speechSamples
+        )
+        return result
+    }
+
+    var windowEnergy = speechSamples[..<targetCount].reduce(Double.zero) {
+        $0 + Double($1 * $1)
+    }
+    var bestEnergy = windowEnergy
+    var bestStart = 0
+    for start in 1...(speechSamples.count - targetCount) {
+        let leaving = speechSamples[start - 1]
+        let entering = speechSamples[start + targetCount - 1]
+        windowEnergy += Double(entering * entering - leaving * leaving)
+        if windowEnergy > bestEnergy {
+            bestEnergy = windowEnergy
+            bestStart = start
+        }
+    }
+    return Array(speechSamples[bestStart..<(bestStart + targetCount)])
+}
+
 @MainActor
 func speechPCMBufferSlices(
     _ source: AVAudioPCMBuffer,
@@ -1137,6 +1350,53 @@ nonisolated enum PocketStreamingPlaybackProgress {
                 + Double(commaPauses) * 0.16
         )
         return Int64(estimatedSeconds * Double(PocketTtsConstants.audioSampleRate))
+    }
+}
+
+nonisolated struct OpenRouterSpeechChunkAccumulator {
+    private static let immediateChunkCount = 2
+    private static let preferredCharacters = 600
+    private static let maximumCharacters = 900
+
+    private var immediateChunksEmitted = 0
+    private var pendingText = ""
+
+    mutating func ingest(_ phrase: String) -> [String] {
+        let trimmedPhrase = phrase.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !trimmedPhrase.isEmpty else { return [] }
+
+        if immediateChunksEmitted < Self.immediateChunkCount {
+            immediateChunksEmitted += 1
+            return [trimmedPhrase]
+        }
+
+        if pendingText.isEmpty {
+            pendingText = trimmedPhrase
+        } else {
+            let candidate = pendingText + " " + trimmedPhrase
+            if candidate.count > Self.maximumCharacters {
+                let completed = pendingText
+                pendingText = trimmedPhrase
+                return [completed]
+            }
+            pendingText = candidate
+        }
+
+        guard pendingText.count >= Self.preferredCharacters else {
+            return []
+        }
+        let completed = pendingText
+        pendingText = ""
+        return [completed]
+    }
+
+    mutating func finish() -> [String] {
+        guard !pendingText.isEmpty else { return [] }
+        let completed = pendingText
+        pendingText = ""
+        return [completed]
     }
 }
 
@@ -1371,7 +1631,12 @@ nonisolated final class StreamingPhrasePlaybackState: @unchecked Sendable {
             let text = [phrase.precedingText, visiblePhrase]
                 .filter { !$0.isEmpty }
                 .joined(separator: " ")
-            guard text != lastPlaybackText else { return nil }
+            // A buffer-completion callback for an earlier phrase can land after
+            // a later phrase is already audible; its cumulative text is a short
+            // prefix. Playback only ever moves forward, so a shorter position is
+            // stale, not news — reporting it would drag the reader's highlight
+            // (and the page with it) back towards the top of the document.
+            guard text.count > lastPlaybackText.count else { return nil }
             lastPlaybackText = text
             return text
         }

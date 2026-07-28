@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SpeechModelsView: View {
     @Environment(AppState.self) private var appState
@@ -16,6 +17,7 @@ struct SpeechModelsView: View {
     @State private var openRouterStatusMessage: String?
     @State private var openRouterSearch = ""
     @State private var isRefreshingOpenRouter = false
+    @State private var isChoosingStyleTTS2Reference = false
 
     var body: some View {
         @Bindable var settings = appState.settings
@@ -61,12 +63,23 @@ struct SpeechModelsView: View {
                 }
             }
 
-            DSSection(overline: "FluidAudio Models") {
-                ForEach(Array(SpeechSynthesisModel.localCases.enumerated()), id: \.element) { index, model in
-                    if index > 0 {
-                        DSDivider()
+            if selectedModel == .styleTTS2 {
+                DSPanel(
+                    text: speechConfiguration.styleTTS2ReferenceAudioURL == nil
+                        ? "StyleTTS2 needs a clean reference recording before it can speak. A studio-quality clip of at least two seconds works best."
+                        : "StyleTTS2 conditions every response on the selected reference recording. It runs locally and supports English.",
+                    tone: .info
+                )
+            }
+
+            if selectedModel.isLocal {
+                DSSection(overline: "FluidAudio Models") {
+                    ForEach(Array(SpeechSynthesisModel.localCases.enumerated()), id: \.element) { index, model in
+                        if index > 0 {
+                            DSDivider()
+                        }
+                        modelRow(model, manager: manager, selectedModel: selectedModel)
                     }
-                    modelRow(model, manager: manager, selectedModel: selectedModel)
                 }
             }
 
@@ -84,6 +97,20 @@ struct SpeechModelsView: View {
         .task {
             manager.refresh()
             await refreshOpenRouterModels()
+        }
+        .fileImporter(
+            isPresented: $isChoosingStyleTTS2Reference,
+            allowedContentTypes: [.audio],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                settings.styleTTS2ReferenceAudioPath = url.path
+                manager.errorMessage = nil
+            case .failure(let error):
+                manager.errorMessage = error.localizedDescription
+            }
         }
         .alert(
             "Delete \(pendingDeletion?.displayName ?? "Speech Model")?",
@@ -157,6 +184,34 @@ struct SpeechModelsView: View {
                     title: \.displayName,
                     isEnabled: appState.status == .idle
                 )
+            }
+            DSDivider()
+            DSInfoRow(label: "Language", value: "English")
+
+        case .styleTTS2:
+            DSInfoRow(label: "Reference Voice") {
+                HStack(spacing: 8) {
+                    Text(styleTTS2ReferenceName(settings: settings))
+                        .font(DS.Fonts.ui(12.5))
+                        .foregroundStyle(DS.Colors.textSecondary)
+                        .lineLimit(1)
+                    Button(
+                        settings.styleTTS2ReferenceAudioPath.isEmpty
+                            ? "Choose Audio…"
+                            : "Replace…"
+                    ) {
+                        isChoosingStyleTTS2Reference = true
+                    }
+                    .buttonStyle(.dsSecondary)
+                    .disabled(appState.status != .idle)
+                    if !settings.styleTTS2ReferenceAudioPath.isEmpty {
+                        Button("Clear") {
+                            settings.styleTTS2ReferenceAudioPath = ""
+                        }
+                        .buttonStyle(.dsDestructive)
+                        .disabled(appState.status != .idle)
+                    }
+                }
             }
             DSDivider()
             DSInfoRow(label: "Language", value: "English")
@@ -336,6 +391,17 @@ struct SpeechModelsView: View {
             content()
                 .frame(width: 360)
         }
+    }
+
+    private func styleTTS2ReferenceName(settings: Settings) -> String {
+        let path = settings.styleTTS2ReferenceAudioPath.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !path.isEmpty else { return "No reference selected" }
+        guard FileManager.default.fileExists(atPath: path) else {
+            return "Reference file is missing"
+        }
+        return URL(fileURLWithPath: path).lastPathComponent
     }
 
     private func matchingOpenRouterModels() -> [OpenRouterSpeechService.Model] {

@@ -10,12 +10,17 @@ import SwiftUI
 enum SpeechReadinessWarning {
     static func message(
         for model: SpeechSynthesisModel,
-        isReady: Bool
+        isReady: Bool,
+        isModelDownloaded: Bool? = nil
     ) -> String? {
         guard !isReady else { return nil }
 
+        if model == .styleTTS2, isModelDownloaded == true {
+            return "StyleTTS2 needs a reference recording. Choose one on the Speech Model page."
+        }
+
         if model.isLocal {
-            return "\(model.displayName) isn’t downloaded. Download it before the Voice Assistant can speak responses."
+            return "\(model.displayName) isn’t downloaded. Download it before speech playback can begin."
         }
 
         return "OpenRouter speech isn’t ready. Add the shared API key, then choose a speech model and voice."
@@ -25,9 +30,11 @@ enum SpeechReadinessWarning {
 enum SidebarPage: String, CaseIterable, Identifiable {
     case models
     case speechOutput
+    case readAloud
     case settings
     case shortcuts
     case voiceAssistant
+    case conversationMemory
     case textOverlay
     case aiPostProcessing
     case history
@@ -39,9 +46,11 @@ enum SidebarPage: String, CaseIterable, Identifiable {
         switch self {
         case .models: return "Dictation Model"
         case .speechOutput: return "Speech Model"
+        case .readAloud: return "Read Aloud"
         case .settings: return "General"
         case .shortcuts: return "Shortcuts"
         case .voiceAssistant: return "Voice Assistant"
+        case .conversationMemory: return "Conversation Memory"
         case .textOverlay: return "Text & Overlay"
         case .aiPostProcessing: return "Transcript Cleanup"
         case .history: return "Dictation History"
@@ -53,9 +62,11 @@ enum SidebarPage: String, CaseIterable, Identifiable {
         switch self {
         case .models: return "cpu"
         case .speechOutput: return "speaker.wave.3"
+        case .readAloud: return "doc.text"
         case .settings: return "slider.horizontal.3"
         case .shortcuts: return "command"
         case .voiceAssistant: return "waveform.and.mic"
+        case .conversationMemory: return "bubble.left.and.bubble.right"
         case .textOverlay: return "textformat"
         case .aiPostProcessing: return "wand.and.stars"
         case .history: return "clock.arrow.circlepath"
@@ -147,14 +158,17 @@ struct MainWindow: View {
     }
 
     private var speechWarningMessage: String? {
+        guard appState.selectedPage != .readAloud else { return nil }
+
         let settings = appState.settings
         let configuration = SpeechOutputConfiguration(settings: settings)
-        let isReady = settings.speechSynthesisModel.isLocal
-            ? appState.speechModelManager.isDownloaded(settings.speechSynthesisModel)
-            : configuration.isReady
+        let isModelDownloaded = appState.speechModelManager.isDownloaded(
+            settings.speechSynthesisModel
+        )
         return SpeechReadinessWarning.message(
             for: settings.speechSynthesisModel,
-            isReady: isReady
+            isReady: configuration.isReady,
+            isModelDownloaded: isModelDownloaded
         )
     }
 
@@ -165,12 +179,16 @@ struct MainWindow: View {
             ModelsView()
         case .speechOutput:
             SpeechModelsView()
+        case .readAloud:
+            ReadAloudView()
         case .settings:
             SettingsView()
         case .shortcuts:
             ShortcutsView()
         case .voiceAssistant:
             VoiceAssistantView()
+        case .conversationMemory:
+            ConversationMemoryView()
         case .textOverlay:
             TextOverlayView()
         case .aiPostProcessing:

@@ -676,7 +676,8 @@ enum OllamaPostProcessingService {
         baseURL: String,
         model: String,
         reasoning: OllamaReasoningSetting = .disabled,
-        instructions: String
+        instructions: String,
+        history: [VoiceAgentMessage] = []
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -686,29 +687,19 @@ enum OllamaPostProcessingService {
                         throw ServiceError.missingModel
                     }
 
-                    var request = URLRequest(url: try endpointURL(baseURL: baseURL, endpoint: .generate))
-                    request.httpMethod = "POST"
-                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    request.timeoutInterval = 90
-
-                    var payload: [String: Any] = [
-                        "model": trimmedModel,
-                        "system": instructions,
-                        "prompt": text,
-                        "stream": true,
-                        "keep_alive": "10m",
-                        "options": [
-                            "temperature": 0.2
-                        ]
-                    ]
-                    if let think = await thinkRequestValue(
+                    let think = await thinkRequestValue(
                         for: reasoning,
                         baseURL: baseURL,
                         model: trimmedModel
-                    ) {
-                        payload["think"] = think
-                    }
-                    request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+                    )
+                    let request = try makeStreamingChatRequest(
+                        text: text,
+                        baseURL: baseURL,
+                        model: trimmedModel,
+                        instructions: instructions,
+                        history: history,
+                        think: think
+                    )
 
                     let (bytes, response) = try await URLSession.shared.bytes(for: request)
                     guard let httpResponse = response as? HTTPURLResponse else {
@@ -730,12 +721,12 @@ enum OllamaPostProcessingService {
                         let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !trimmedLine.isEmpty else { continue }
 
-                        let decoded = try decoder.decode(GenerateResponse.self, from: Data(trimmedLine.utf8))
+                        let decoded = try decoder.decode(ChatResponse.self, from: Data(trimmedLine.utf8))
                         if let error = decoded.error?.trimmingCharacters(in: .whitespacesAndNewlines),
                            !error.isEmpty {
                             throw ServiceError.serverMessage(error)
                         }
-                        guard let chunk = decoded.response, !chunk.isEmpty else { continue }
+                        guard let chunk = decoded.message?.content, !chunk.isEmpty else { continue }
                         cumulativeResponse += chunk
                         continuation.yield(cumulativeResponse)
                     }
@@ -755,6 +746,59 @@ enum OllamaPostProcessingService {
                 task.cancel()
             }
         }
+    }
+
+    static func makeStreamingChatRequest(
+        text: String,
+        baseURL: String,
+        model: String,
+        instructions: String,
+        history: [VoiceAgentMessage] = [],
+        think: Any? = nil
+    ) throws -> URLRequest {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else {
+            throw ServiceError.missingModel
+        }
+
+        var request = URLRequest(url: try endpointURL(baseURL: baseURL, endpoint: .chat))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 90
+
+        var messages: [[String: String]] = [
+            [
+                "role": "system",
+                "content": instructions,
+            ]
+        ]
+        messages.append(contentsOf: history.map { message in
+            [
+                "role": message.role.rawValue,
+                "content": message.content,
+            ]
+        })
+        messages.append(
+            [
+                "role": "user",
+                "content": text,
+            ]
+        )
+
+        var payload: [String: Any] = [
+            "model": trimmedModel,
+            "messages": messages,
+            "stream": true,
+            "keep_alive": "10m",
+            "options": [
+                "temperature": 0.2
+            ]
+        ]
+        if let think {
+            payload["think"] = think
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        return request
     }
 
     static func cliAvailability() -> CLIAvailability {
@@ -906,6 +950,7 @@ enum OllamaPostProcessingService {
 
     private enum Endpoint {
         case generate
+        case chat
         case tags
         case pull
         case show
@@ -913,6 +958,7 @@ enum OllamaPostProcessingService {
         var pathSuffix: String {
             switch self {
             case .generate: return "api/generate"
+            case .chat: return "api/chat"
             case .tags: return "api/tags"
             case .pull: return "api/pull"
             case .show: return "api/show"
@@ -970,6 +1016,15 @@ enum OllamaPostProcessingService {
             case evalCount = "eval_count"
             case evalDuration = "eval_duration"
         }
+    }
+
+    private struct ChatResponse: Decodable {
+        struct Message: Decodable {
+            let content: String?
+        }
+
+        let message: Message?
+        let error: String?
     }
 
     private struct PullResponse: Decodable {
@@ -1119,6 +1174,16 @@ enum OllamaPostProcessingService {
                 components.path = "/api/generate"
             } else {
                 components.path = "/" + [trimmedPath, "api", "generate"].joined(separator: "/")
+            }
+        case .chat:
+            if trimmedPath.hasSuffix("api/chat") {
+                break
+            } else if trimmedPath.hasSuffix("api") {
+                components.path = "/" + [trimmedPath, "chat"].joined(separator: "/")
+            } else if trimmedPath.isEmpty {
+                components.path = "/api/chat"
+            } else {
+                components.path = "/" + [trimmedPath, "api", "chat"].joined(separator: "/")
             }
         case .tags:
             if trimmedPath.hasSuffix("api/tags") {
@@ -1538,6 +1603,7 @@ enum OpenRouterPostProcessingService {
         text: String,
         model: String,
         instructions: String,
+        history: [VoiceAgentMessage] = [],
         webSearchEnabled: Bool = false,
         apiKey: String,
         apiKeyEnvironmentVariable: String
@@ -1558,6 +1624,7 @@ enum OpenRouterPostProcessingService {
                         text: text,
                         model: trimmedModel,
                         instructions: instructions,
+                        history: history,
                         webSearchEnabled: webSearchEnabled,
                         apiKey: resolvedKey
                     )
@@ -1624,6 +1691,7 @@ enum OpenRouterPostProcessingService {
         text: String,
         model: String,
         instructions: String,
+        history: [VoiceAgentMessage] = [],
         webSearchEnabled: Bool,
         apiKey: String
     ) throws -> URLRequest {
@@ -1642,18 +1710,28 @@ enum OpenRouterPostProcessingService {
         request.setValue(appTitle, forHTTPHeaderField: "X-OpenRouter-Title")
         request.setValue(appTitle, forHTTPHeaderField: "X-Title")
 
+        var messages: [[String: String]] = [
+            [
+                "role": "system",
+                "content": instructions,
+            ]
+        ]
+        messages.append(contentsOf: history.map { message in
+            [
+                "role": message.role.rawValue,
+                "content": message.content,
+            ]
+        })
+        messages.append(
+            [
+                "role": "user",
+                "content": text,
+            ]
+        )
+
         var payload: [String: Any] = [
             "model": resolvedModel,
-            "messages": [
-                [
-                    "role": "system",
-                    "content": instructions
-                ],
-                [
-                    "role": "user",
-                    "content": text
-                ]
-            ],
+            "messages": messages,
             "temperature": 0.2,
             "stream": true
         ]

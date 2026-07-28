@@ -117,6 +117,12 @@ struct VoiceAgentToolStatus: Sendable {
 enum VoiceAgentStreamEvent: Sendable {
     case toolStatus(VoiceAgentToolStatus)
     case response(String)
+    case completed(VoiceAgentRoute)
+}
+
+enum VoiceAgentRoute: Equatable, Sendable {
+    case general
+    case codex
 }
 
 enum VoiceAgentToolAcknowledgement {
@@ -174,8 +180,14 @@ enum VoiceAgentService {
         let openRouterAPIKeyEnvironmentVariable: String
         let codexToolEnabled: Bool
         let codexWorkspacePath: String
+        let generalConversationHistory: [VoiceConversationExchange]
+        let codexConversationHistory: [VoiceConversationExchange]
 
-        init(settings: Settings) {
+        init(
+            settings: Settings,
+            generalConversationHistory: [VoiceConversationExchange] = [],
+            codexConversationHistory: [VoiceConversationExchange] = []
+        ) {
             provider = settings.agentBrainProvider
             systemPrompt = settings.agentSystemPrompt
             ollamaBaseURL = settings.ollamaBaseURL
@@ -187,6 +199,8 @@ enum VoiceAgentService {
             openRouterAPIKeyEnvironmentVariable = settings.openRouterAPIKeyEnvironmentVariable
             codexToolEnabled = settings.codexToolEnabled
             codexWorkspacePath = settings.codexWorkspacePath
+            self.generalConversationHistory = generalConversationHistory
+            self.codexConversationHistory = codexConversationHistory
         }
     }
 
@@ -231,6 +245,8 @@ enum VoiceAgentService {
                             await status.didFinishSpeaking()
                         case .response(let response):
                             continuation.yield(response)
+                        case .completed:
+                            break
                         }
                     }
                     continuation.finish()
@@ -260,6 +276,7 @@ enum VoiceAgentService {
                     }
 
                     var finalResponse = ""
+                    var finalRoute: VoiceAgentRoute = .general
                     if CodexToolIntent.matches(trimmedPrompt) {
                         guard configuration.codexToolEnabled else {
                             throw CodexToolService.ServiceError.disabled
@@ -272,8 +289,10 @@ enum VoiceAgentService {
                         let source = CodexToolService.streamResponse(
                             to: trimmedPrompt,
                             workspacePath: configuration.codexWorkspacePath,
-                            systemPrompt: configuration.systemPrompt
+                            systemPrompt: configuration.systemPrompt,
+                            conversationHistory: configuration.codexConversationHistory
                         )
+                        finalRoute = .codex
                         try await yieldResponses(
                             from: source,
                             continuation: continuation,
@@ -289,6 +308,7 @@ enum VoiceAgentService {
                         let source = brainResponseStream(
                             to: trimmedPrompt,
                             systemPrompt: brainInstructions,
+                            conversationHistory: configuration.generalConversationHistory,
                             configuration: configuration
                         )
 
@@ -320,8 +340,10 @@ enum VoiceAgentService {
                             let codexSource = CodexToolService.streamResponse(
                                 to: trimmedPrompt,
                                 workspacePath: configuration.codexWorkspacePath,
-                                systemPrompt: configuration.systemPrompt
+                                systemPrompt: configuration.systemPrompt,
+                                conversationHistory: configuration.codexConversationHistory
                             )
+                            finalRoute = .codex
                             try await yieldResponses(
                                 from: codexSource,
                                 continuation: continuation,
@@ -336,6 +358,7 @@ enum VoiceAgentService {
                     guard !finalResponse.isEmpty else {
                         throw ServiceError.emptyResponse
                     }
+                    continuation.yield(.completed(finalRoute))
                     continuation.finish()
                 } catch is CancellationError {
                     continuation.finish()
@@ -383,13 +406,16 @@ enum VoiceAgentService {
     private static func brainResponseStream(
         to prompt: String,
         systemPrompt: String,
+        conversationHistory: [VoiceConversationExchange],
         configuration: Configuration
     ) -> AsyncThrowingStream<String, Error> {
+        let historyMessages = VoiceConversationContext.messages(from: conversationHistory)
         switch configuration.provider {
         case .appleIntelligence:
             return appleIntelligenceResponseStream(
                 to: prompt,
-                systemPrompt: systemPrompt
+                systemPrompt: systemPrompt,
+                history: historyMessages
             )
         case .ollama:
             return OllamaPostProcessingService.streamAnswer(
@@ -397,13 +423,15 @@ enum VoiceAgentService {
                 baseURL: configuration.ollamaBaseURL,
                 model: configuration.ollamaModel,
                 reasoning: configuration.ollamaReasoning,
-                instructions: systemPrompt
+                instructions: systemPrompt,
+                history: historyMessages
             )
         case .openRouter:
             return OpenRouterPostProcessingService.streamAnswer(
                 text: prompt,
                 model: configuration.openRouterModel,
                 instructions: systemPrompt,
+                history: historyMessages,
                 webSearchEnabled: configuration.openRouterWebSearchEnabled,
                 apiKey: configuration.openRouterAPIKey,
                 apiKeyEnvironmentVariable: configuration.openRouterAPIKeyEnvironmentVariable
@@ -413,7 +441,8 @@ enum VoiceAgentService {
 
     private static func appleIntelligenceResponseStream(
         to prompt: String,
-        systemPrompt: String
+        systemPrompt: String,
+        history: [VoiceAgentMessage]
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -425,7 +454,12 @@ enum VoiceAgentService {
                         throw ServiceError.appleIntelligenceUnavailable
                     }
 
-                    let session = LanguageModelSession(instructions: systemPrompt)
+                    let session = LanguageModelSession(
+                        transcript: appleTranscript(
+                            systemPrompt: systemPrompt,
+                            history: history
+                        )
+                    )
                     for try await snapshot in session.streamResponse(to: prompt) {
                         try Task.checkCancellation()
                         continuation.yield(snapshot.content)
@@ -442,6 +476,46 @@ enum VoiceAgentService {
                 task.cancel()
             }
         }
+    }
+
+    @available(macOS 26, *)
+    static func appleTranscript(
+        systemPrompt: String,
+        history: [VoiceAgentMessage]
+    ) -> Transcript {
+        let textSegment: (String) -> Transcript.Segment = { content in
+            .text(Transcript.TextSegment(content: content))
+        }
+        var entries: [Transcript.Entry] = [
+            .instructions(
+                Transcript.Instructions(
+                    segments: [textSegment(systemPrompt)],
+                    toolDefinitions: []
+                )
+            )
+        ]
+
+        for message in history {
+            switch message.role {
+            case .user:
+                entries.append(
+                    .prompt(
+                        Transcript.Prompt(segments: [textSegment(message.content)])
+                    )
+                )
+            case .assistant:
+                entries.append(
+                    .response(
+                        Transcript.Response(
+                            assetIDs: [],
+                            segments: [textSegment(message.content)]
+                        )
+                    )
+                )
+            }
+        }
+
+        return Transcript(entries: entries)
     }
 }
 

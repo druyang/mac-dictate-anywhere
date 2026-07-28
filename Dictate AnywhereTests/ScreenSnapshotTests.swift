@@ -15,9 +15,16 @@ final class ScreenSnapshotTests: XCTestCase {
         return url
     }()
 
-    private func renderWindow(page: SidebarPage, file: StaticString = #filePath, line: UInt = #line) {
+    private func renderWindow(
+        page: SidebarPage,
+        variant: String? = nil,
+        configure: (AppState) -> Void = { _ in },
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
         let appState = AppState()
         appState.selectedPage = page
+        configure(appState)
 
         let view = MainWindow()
             .environment(appState)
@@ -36,7 +43,8 @@ final class ScreenSnapshotTests: XCTestCase {
         if let tiff = image.tiffRepresentation,
            let rep = NSBitmapImageRep(data: tiff),
            let png = rep.representation(using: .png, properties: [:]) {
-            let url = Self.outputDirectory.appendingPathComponent("\(page.rawValue).png")
+            let name = variant.map { "\(page.rawValue)-\($0)" } ?? page.rawValue
+            let url = Self.outputDirectory.appendingPathComponent("\(name).png")
             try? png.write(to: url)
             print("Screenshot written: \(url.path)")
         }
@@ -44,9 +52,31 @@ final class ScreenSnapshotTests: XCTestCase {
 
     func testDictationModelScreenRenders() { renderWindow(page: .models) }
     func testSpeechModelScreenRenders() { renderWindow(page: .speechOutput) }
+    func testReadAloudScreenRenders() { renderWindow(page: .readAloud) }
+
+    /// The reader is a different surface from the empty state: word canvas,
+    /// highlight and player bar.
+    func testReadAloudReaderRenders() {
+        renderWindow(page: .readAloud, variant: "reader") { appState in
+            appState.readAloudText = """
+            Feasibility Assessment
+
+            The demand is real and growing fast, the pricing supports a good living, \
+            and twenty years of engineering depth place this founder in a genuinely \
+            underserved band above the crowded no-code end of the market.
+
+            The better entry point is small and mid-sized businesses in one vertical \
+            he already understands, not broad solopreneurs. Solopreneurs mostly run on \
+            free tiers and rarely pay for implementation, while SMBs have budget, real \
+            workflow pain, and a documented willingness to trust an outside advisor.
+            """
+            appState.seekReadAloud(toWordIndex: 40)
+        }
+    }
     func testGeneralScreenRenders() { renderWindow(page: .settings) }
     func testShortcutsScreenRenders() { renderWindow(page: .shortcuts) }
     func testVoiceAssistantScreenRenders() { renderWindow(page: .voiceAssistant) }
+    func testConversationMemoryScreenRenders() { renderWindow(page: .conversationMemory) }
     func testTextOverlayScreenRenders() { renderWindow(page: .textOverlay) }
     func testTranscriptCleanupScreenRenders() { renderWindow(page: .aiPostProcessing) }
     func testDictationHistoryScreenRenders() { renderWindow(page: .history) }

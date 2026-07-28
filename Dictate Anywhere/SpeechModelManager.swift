@@ -90,6 +90,18 @@ final class SpeechModelManager {
                     progressHandler: progressHandler(base: 0, weight: 1)
                 )
 
+            case .styleTTS2:
+                try await ModelHub.download(
+                    .styletts2,
+                    to: Self.modelsRoot,
+                    additionalModelNames: ModelNames.StyleTTS2.allModels,
+                    progressHandler: progressHandler(base: 0, weight: 0.88)
+                )
+                try await StyleTTS2ResourceDownloader.ensureG2PAssets(
+                    progressHandler: progressHandler(base: 0.88, weight: 0.11)
+                )
+                _ = try await StyleTTS2ResourceDownloader.ensureLexiconCache()
+
             case .openRouter:
                 throw SpeechModelError.cloudModelDoesNotDownload
             }
@@ -132,7 +144,7 @@ final class SpeechModelManager {
     private func progressHandler(
         base: Double,
         weight: Double
-    ) -> DownloadUtils.ProgressHandler {
+    ) -> ProgressHandler {
         { [weak self] progress in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -190,8 +202,32 @@ final class SpeechModelManager {
                 root.appendingPathComponent($0)
             }
 
+        case .styleTTS2:
+            let modelRoot = modelsRoot.appendingPathComponent(Repo.styletts2.folderName)
+            let g2pRoot = modelsRoot.appendingPathComponent(Repo.kokoro.folderName)
+            return styleTTS2BundleSentinelURLs(in: modelRoot) + ModelNames.G2P.requiredModels.map {
+                g2pRoot.appendingPathComponent($0)
+            } + [
+                g2pRoot.appendingPathComponent("us_lexicon_cache.json")
+            ]
+
         case .openRouter:
             return []
+        }
+    }
+
+    nonisolated static func styleTTS2BundleSentinelURLs(
+        in modelRoot: URL
+    ) -> [URL] {
+        ModelNames.StyleTTS2.allModels.sorted().flatMap { modelName in
+            let bundle = modelRoot.appendingPathComponent(modelName)
+            return [
+                bundle.appendingPathComponent("model.mil"),
+                bundle.appendingPathComponent("coremldata.bin"),
+                bundle
+                    .appendingPathComponent("weights", isDirectory: true)
+                    .appendingPathComponent("weight.bin"),
+            ]
         }
     }
 
@@ -212,6 +248,11 @@ final class SpeechModelManager {
                     .appendingPathComponent(Repo.pocketTts.folderName)
                     .appendingPathComponent(PocketTtsLanguage.english.repoSubdirectory)
             ]
+        case .styleTTS2:
+            return [
+                modelsRoot.appendingPathComponent(Repo.styletts2.folderName),
+                modelsRoot.appendingPathComponent(Repo.kokoro.folderName),
+            ]
         case .openRouter:
             return []
         }
@@ -220,14 +261,26 @@ final class SpeechModelManager {
     private nonisolated static func deletableURLs(
         for model: SpeechSynthesisModel
     ) -> [URL] {
-        guard model == .kokoroAne else { return storageURLs(for: model) }
+        switch model {
+        case .kokoroAne:
+            var urls = [modelsRoot.appendingPathComponent(Repo.kokoroAne.folderName)]
+            let styleTTSRoot = modelsRoot.appendingPathComponent(Repo.styletts2.folderName)
+            if !FileManager.default.fileExists(atPath: styleTTSRoot.path) {
+                urls.append(modelsRoot.appendingPathComponent(Repo.kokoro.folderName))
+            }
+            return urls
 
-        var urls = [modelsRoot.appendingPathComponent(Repo.kokoroAne.folderName)]
-        let styleTTSRoot = modelsRoot.appendingPathComponent(Repo.styletts2.folderName)
-        if !FileManager.default.fileExists(atPath: styleTTSRoot.path) {
-            urls.append(modelsRoot.appendingPathComponent(Repo.kokoro.folderName))
+        case .styleTTS2:
+            var urls = [modelsRoot.appendingPathComponent(Repo.styletts2.folderName)]
+            let kokoroAneRoot = modelsRoot.appendingPathComponent(Repo.kokoroAne.folderName)
+            if !FileManager.default.fileExists(atPath: kokoroAneRoot.path) {
+                urls.append(modelsRoot.appendingPathComponent(Repo.kokoro.folderName))
+            }
+            return urls
+
+        case .supertonic3, .pocketTTS, .openRouter:
+            return storageURLs(for: model)
         }
-        return urls
     }
 
     private nonisolated static func diskUsage(
@@ -261,6 +314,7 @@ enum SpeechModelError: LocalizedError {
     case downloadInProgress
     case cloudModelDoesNotDownload
     case invalidVoice(String)
+    case missingStyleTTS2ReferenceAudio
     case modelNotDownloaded(SpeechSynthesisModel)
 
     var errorDescription: String? {
@@ -271,6 +325,8 @@ enum SpeechModelError: LocalizedError {
             return "OpenRouter speech models run in the cloud and do not need to be downloaded."
         case .invalidVoice(let voice):
             return "The selected voice \(voice) is not available."
+        case .missingStyleTTS2ReferenceAudio:
+            return "Choose a clean reference recording before using StyleTTS2."
         case .modelNotDownloaded(let model):
             return "Download \(model.displayName) in Speech Model settings before using it."
         }

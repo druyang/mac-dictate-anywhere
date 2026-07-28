@@ -16,6 +16,9 @@ struct SettingsMultilineTextArea: View {
     let minHeight: CGFloat
     let maxHeight: CGFloat
     let showsResizeHandle: Bool
+    /// Takes keyboard focus as soon as the field appears, for places that exist
+    /// only to be typed into.
+    let focusesOnAppear: Bool
 
     @State private var isFocused = false
     @State private var height: CGFloat
@@ -26,13 +29,15 @@ struct SettingsMultilineTextArea: View {
         placeholder: String,
         minHeight: CGFloat = 80,
         maxHeight: CGFloat = 240,
-        showsResizeHandle: Bool = true
+        showsResizeHandle: Bool = true,
+        focusesOnAppear: Bool = false
     ) {
         _text = text
         self.placeholder = placeholder
         self.minHeight = minHeight
         self.maxHeight = maxHeight
         self.showsResizeHandle = showsResizeHandle
+        self.focusesOnAppear = focusesOnAppear
         _height = State(initialValue: minHeight)
     }
 
@@ -52,7 +57,11 @@ struct SettingsMultilineTextArea: View {
                     )
                 )
 
-            AppKitMultilineTextView(text: $text, isFocused: $isFocused)
+            AppKitMultilineTextView(
+                text: $text,
+                isFocused: $isFocused,
+                focusesOnAppear: focusesOnAppear
+            )
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
                 .padding(.trailing, showsResizeHandle ? 10 : 0)
@@ -118,6 +127,7 @@ struct SettingsMultilineTextArea: View {
 private struct AppKitMultilineTextView: NSViewRepresentable {
     @Binding var text: String
     @Binding var isFocused: Bool
+    var focusesOnAppear = false
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text, isFocused: $isFocused)
@@ -166,6 +176,16 @@ private struct AppKitMultilineTextView: NSViewRepresentable {
         )
 
         scrollView.documentView = textView
+
+        if focusesOnAppear {
+            // The window isn't attached during makeNSView, so ask for first
+            // responder once this run of the runloop has installed the view.
+            DispatchQueue.main.async { [weak textView] in
+                guard let textView, let window = textView.window else { return }
+                window.makeFirstResponder(textView)
+            }
+        }
+
         return scrollView
     }
 

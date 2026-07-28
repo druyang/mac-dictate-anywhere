@@ -11,6 +11,49 @@ import CoreAudio
 import os
 import FoundationModels
 
+nonisolated enum ReadAloudPlaybackProgress {
+    static func wordCount(in text: String) -> Int {
+        text.split(whereSeparator: \.isWhitespace).count
+    }
+
+    static func fraction(
+        playedText: String,
+        totalText: String,
+        isComplete: Bool
+    ) -> Double {
+        fraction(
+            playedWordCount: wordCount(in: playedText),
+            totalWordCount: wordCount(in: totalText),
+            isComplete: isComplete
+        )
+    }
+
+    static func fraction(
+        playedWordCount: Int,
+        totalWordCount: Int,
+        isComplete: Bool
+    ) -> Double {
+        if isComplete {
+            return 1
+        }
+        guard totalWordCount > 0 else { return 0 }
+        return min(
+            max(Double(playedWordCount) / Double(totalWordCount), 0),
+            0.99
+        )
+    }
+
+    static func remainingText(
+        in totalText: String,
+        afterPlayedWordCount playedWordCount: Int
+    ) -> String {
+        totalText
+            .split(whereSeparator: \.isWhitespace)
+            .dropFirst(max(playedWordCount, 0))
+            .joined(separator: " ")
+    }
+}
+
 @Observable
 @MainActor
 final class AppState {
@@ -50,6 +93,36 @@ final class AppState {
     var lastAgentError: String?
     var isAgentRequestInProgress = false
     var isSpeechOutputInProgress = false
+    var readAloudText = "" {
+        didSet {
+            guard readAloudText != oldValue else { return }
+            readAloudDocument = ReadAloudDocument(source: readAloudText)
+            if !isReadAloudInProgress, !isReadAloudPaused {
+                readAloudWordIndex = 0
+                isReadAloudFinished = false
+            }
+        }
+    }
+
+    /// Word-addressable view of `readAloudText`, rebuilt on every edit. The
+    /// reader renders these words and playback positions are word indices into
+    /// it, so a click on a word is a seek.
+    private(set) var readAloudDocument = ReadAloudDocument.empty
+    /// Number of words already spoken — equivalently, the word playback resumes
+    /// from.
+    var readAloudWordIndex = 0
+    private(set) var isReadAloudFinished = false
+    /// Whether the Read Aloud page is showing its editor rather than the
+    /// reader. It lives here, not in view state, because the window's warning
+    /// banners appear and disappear underneath the page — that reshuffles view
+    /// identity and would silently drop an in-progress edit.
+    var isEditingReadAloudText = false
+    var readAloudError: String?
+    var isReadAloudInProgress = false
+    var isReadAloudPaused = false
+    var agentMemoryExchangeCount = 0
+    var agentMemoryEntries: [VoiceConversationMemoryEntry] = []
+    var agentMemoryStorageError: String?
 
     /// Static accessor for AppDelegate menu bar (avoids circular dependency)
     nonisolated(unsafe) static var lastTranscriptForMenuBar = ""
@@ -68,6 +141,7 @@ final class AppState {
     let appleSpeechEngine = AppleSpeechEngine()
     let speechModelManager = SpeechModelManager()
     let speechOutputService = SpeechOutputService()
+    let voiceConversationStore: VoiceConversationStore
     var appleSpeechSupportedLanguages: [SupportedLanguage] = []
     private var isShowingMigrationAlert = false
 
@@ -92,6 +166,9 @@ final class AppState {
     private var sessionHotkeyAction: HotkeyAction?
     private var agentRequestGeneration = 0
     private var agentRequestTask: Task<Void, Never>?
+    private var readAloudGeneration = 0
+    private var readAloudTask: Task<Void, Never>?
+    private var readAloudSegmentStart = 0
     private var startupTask: Task<Void, Never>?
     private var hasStarted = false
 
@@ -112,7 +189,24 @@ final class AppState {
 
     // MARK: - Initialization
 
-    init() {
+    init(voiceConversationStore: VoiceConversationStore? = nil) {
+        if let voiceConversationStore {
+            self.voiceConversationStore = voiceConversationStore
+        } else {
+            do {
+                self.voiceConversationStore = try VoiceConversationStore(
+                    isStoredInMemoryOnly: AppDelegate.isRunningTests
+                )
+            } catch {
+                self.voiceConversationStore = try! VoiceConversationStore(
+                    isStoredInMemoryOnly: true
+                )
+                agentMemoryStorageError =
+                    "Conversation memory could not open its local database. Changes will not persist after quitting. \(error.localizedDescription)"
+            }
+        }
+
+        refreshAgentMemoryStatus(pruneToCurrentLimit: true)
         setupHotkeyCallbacks()
         setupPermissionCallbacks()
     }
@@ -692,6 +786,10 @@ final class AppState {
     }
 
     func cancelDictation() async {
+        if sessionEngine == nil, isReadAloudInProgress || isReadAloudPaused {
+            stopReadAloud()
+            return
+        }
         if sessionEngine == nil, isAgentRequestInProgress {
             interruptAgentSessionForNewSession()
             return
@@ -721,6 +819,9 @@ final class AppState {
     }
 
     func askAgent(prompt: String) async {
+        if isReadAloudInProgress || isReadAloudPaused {
+            stopReadAloud()
+        }
         interruptAgentSessionForNewSession()
         guard status == .idle, !isTransitioning else { return }
         status = .processing
@@ -786,9 +887,15 @@ final class AppState {
 
         do {
             var response = ""
+            var completedRoute: VoiceAgentRoute?
+            let conversationHistories = agentConversationHistories(for: trimmedPrompt)
             let eventStream = VoiceAgentService.streamEvents(
                 to: trimmedPrompt,
-                configuration: VoiceAgentService.Configuration(settings: settings)
+                configuration: VoiceAgentService.Configuration(
+                    settings: settings,
+                    generalConversationHistory: conversationHistories.general,
+                    codexConversationHistory: conversationHistories.codex
+                )
             )
             for try await event in eventStream {
                 switch event {
@@ -821,10 +928,22 @@ final class AppState {
 
                     startStreamingSpeechIfNeeded()
                     streamingTextContinuation?.yield(partialResponse)
+                case .completed(let route):
+                    completedRoute = route
                 }
             }
             try Task.checkCancellation()
             guard generation == agentRequestGeneration else { return }
+
+            if settings.agentConversationMemoryEnabled,
+               let completedRoute,
+               !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                saveAgentConversationExchange(
+                    userMessage: trimmedPrompt,
+                    assistantMessage: response,
+                    route: completedRoute
+                )
+            }
 
             if let streamingSpeechTask {
                 streamingTextContinuation?.finish()
@@ -882,6 +1001,142 @@ final class AppState {
         isAgentRequestInProgress = false
         overlay.hide(afterDelay: 0.6)
         status = .idle
+    }
+
+    func setAgentMemoryExchangeLimit(_ limit: Int) {
+        settings.agentMemoryExchangeLimit = Settings.clampedAgentMemoryExchangeLimit(limit)
+        refreshAgentMemoryStatus(pruneToCurrentLimit: true)
+    }
+
+    func clearAgentConversationMemory() {
+        do {
+            try voiceConversationStore.clearAll()
+            agentMemoryExchangeCount = 0
+            agentMemoryEntries = []
+            agentMemoryStorageError = nil
+        } catch {
+            agentMemoryStorageError = "Conversation memory could not be cleared. \(error.localizedDescription)"
+        }
+    }
+
+    func deleteAgentConversationMemory(id: UUID) {
+        do {
+            try voiceConversationStore.deleteExchange(id: id)
+            refreshAgentMemoryStatus()
+        } catch {
+            agentMemoryStorageError = "Conversation memory could not be deleted. \(error.localizedDescription)"
+        }
+    }
+
+    func refreshAgentMemoryStatus(pruneToCurrentLimit: Bool = false) {
+        do {
+            if pruneToCurrentLimit {
+                try voiceConversationStore.pruneAll(to: settings.agentMemoryExchangeLimit)
+            }
+            agentMemoryEntries = try voiceConversationStore.allEntries()
+            agentMemoryExchangeCount = agentMemoryEntries.count
+            if voiceConversationStore.storeURL != nil {
+                agentMemoryStorageError = nil
+            }
+        } catch {
+            agentMemoryStorageError = "Conversation memory is unavailable. \(error.localizedDescription)"
+        }
+    }
+
+    private func agentConversationHistories(
+        for prompt: String
+    ) -> (
+        general: [VoiceConversationExchange],
+        codex: [VoiceConversationExchange]
+    ) {
+        guard settings.agentConversationMemoryEnabled else {
+            return ([], [])
+        }
+
+        do {
+            let limit = settings.agentMemoryExchangeLimit
+            let generalExchanges = try voiceConversationStore.exchanges(
+                in: .general,
+                limit: limit
+            )
+            let generalBudget = max(
+                0,
+                VoiceConversationContext.characterBudget(for: settings.agentBrainProvider)
+                    - prompt.count
+                    - settings.agentSystemPrompt.count
+            )
+            let boundedGeneralExchanges = VoiceConversationContext.newestExchanges(
+                from: generalExchanges,
+                fittingCharacterBudget: generalBudget
+            )
+
+            let codexExchanges: [VoiceConversationExchange]
+            if settings.codexWorkspacePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                codexExchanges = []
+            } else {
+                let storedCodexExchanges = try voiceConversationStore.exchanges(
+                    in: .codex(workspacePath: settings.codexWorkspacePath),
+                    limit: limit
+                )
+                let codexBudget = max(
+                    0,
+                    VoiceConversationContext.codexCharacterBudget
+                        - prompt.count
+                        - settings.agentSystemPrompt.count
+                )
+                codexExchanges = VoiceConversationContext.newestExchanges(
+                    from: storedCodexExchanges,
+                    fittingCharacterBudget: codexBudget
+                )
+            }
+
+            return (boundedGeneralExchanges, codexExchanges)
+        } catch {
+            agentMemoryStorageError = "Conversation memory could not be loaded. \(error.localizedDescription)"
+            return ([], [])
+        }
+    }
+
+    private func saveAgentConversationExchange(
+        userMessage: String,
+        assistantMessage: String,
+        route: VoiceAgentRoute
+    ) {
+        let scope: VoiceConversationScope
+        let provider: AgentBrainProvider?
+        let model: String
+
+        switch route {
+        case .general:
+            scope = .general
+            provider = settings.agentBrainProvider
+            switch settings.agentBrainProvider {
+            case .appleIntelligence:
+                model = "system-language-model"
+            case .ollama:
+                model = settings.ollamaModel
+            case .openRouter:
+                model = settings.openRouterModel
+            }
+        case .codex:
+            scope = .codex(workspacePath: settings.codexWorkspacePath)
+            provider = nil
+            model = "codex"
+        }
+
+        do {
+            try voiceConversationStore.appendCompletedExchange(
+                userMessage: userMessage,
+                assistantMessage: assistantMessage,
+                scope: scope,
+                provider: provider,
+                model: model,
+                limit: settings.agentMemoryExchangeLimit
+            )
+            refreshAgentMemoryStatus()
+        } catch {
+            agentMemoryStorageError = "The response completed, but conversation memory could not save it. \(error.localizedDescription)"
+        }
     }
 
     private func makeStreamingSpeech(
@@ -1017,6 +1272,268 @@ final class AppState {
             )
         } catch {
             speechModelManager.errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Fraction of the document already spoken. Never reports a full 1 until
+    /// playback actually finishes, so a nearly-done reading can't look complete.
+    var readAloudProgress: Double {
+        if isReadAloudFinished { return 1 }
+        guard readAloudDocument.wordCount > 0 else { return 0 }
+        let fraction = Double(readAloudWordIndex)
+            / Double(readAloudDocument.wordCount)
+        return min(max(fraction, 0), 0.99)
+    }
+
+    /// Word the reader highlights. While audio is playing the last word handed
+    /// to the player is the one being heard; when idle or paused the highlight
+    /// sits on the word playback would resume from.
+    var readAloudHighlightIndex: Int {
+        guard !readAloudDocument.isEmpty else { return 0 }
+        if isReadAloudInProgress {
+            return readAloudDocument.clampedWordIndex(
+                max(readAloudWordIndex - 1, readAloudSegmentStart)
+            )
+        }
+        return readAloudDocument.clampedWordIndex(readAloudWordIndex)
+    }
+
+    func startReadAloud(fromWordIndex wordIndex: Int = 0) {
+        guard !readAloudDocument.isEmpty else {
+            readAloudError = "Paste some text before starting playback."
+            return
+        }
+        guard status == .idle else { return }
+
+        let configuration = SpeechOutputConfiguration(settings: settings)
+        guard configuration.isReady else {
+            readAloudError =
+                "Set up \(configuration.model.displayName) on the Speech Model page first."
+            return
+        }
+
+        let start = readAloudDocument.clampedWordIndex(wordIndex)
+        readAloudWordIndex = start
+        isReadAloudFinished = false
+        readAloudError = nil
+        isReadAloudPaused = false
+        startReadAloudSegment(from: start, configuration: configuration)
+    }
+
+    /// Moves the reading position. Playback that is already running continues
+    /// from the new word; a paused or idle reader just moves its highlight.
+    func seekReadAloud(toWordIndex wordIndex: Int) {
+        guard !readAloudDocument.isEmpty else { return }
+        let target = readAloudDocument.clampedWordIndex(wordIndex)
+        let wasPlaying = isReadAloudInProgress
+
+        if wasPlaying {
+            cancelReadAloudPlayback()
+        }
+        readAloudWordIndex = target
+        isReadAloudFinished = false
+        readAloudError = nil
+
+        guard wasPlaying else { return }
+        let configuration = SpeechOutputConfiguration(settings: settings)
+        guard configuration.isReady else {
+            isReadAloudPaused = true
+            readAloudError =
+                "Set up \(configuration.model.displayName) on the Speech Model page first."
+            return
+        }
+        startReadAloudSegment(from: target, configuration: configuration)
+    }
+
+    /// Jumps whole sentences, the way a track skip works: backwards restarts
+    /// the current sentence unless it only just began.
+    func skipReadAloudSentence(by delta: Int) {
+        guard !readAloudDocument.isEmpty else { return }
+        let from = readAloudHighlightIndex
+        let target = delta < 0
+            ? readAloudDocument.previousSentenceStart(from: from)
+            : readAloudDocument.nextSentenceStart(from: from)
+
+        guard target < readAloudDocument.wordCount else {
+            // Skipping past the last sentence ends the reading.
+            stopReadAloud()
+            readAloudWordIndex = readAloudDocument.wordCount
+            isReadAloudFinished = true
+            return
+        }
+        seekReadAloud(toWordIndex: target)
+    }
+
+    func toggleReadAloud() {
+        if isReadAloudInProgress {
+            pauseReadAloud()
+        } else if isReadAloudPaused {
+            resumeReadAloud()
+        } else {
+            startReadAloud(
+                fromWordIndex: isReadAloudFinished ? 0 : readAloudWordIndex
+            )
+        }
+    }
+
+    func pauseReadAloud() {
+        guard isReadAloudInProgress else { return }
+
+        cancelReadAloudPlayback()
+        isReadAloudPaused = true
+    }
+
+    func resumeReadAloud() {
+        guard isReadAloudPaused, status == .idle else { return }
+
+        guard readAloudWordIndex < readAloudDocument.wordCount else {
+            isReadAloudPaused = false
+            isReadAloudFinished = true
+            return
+        }
+
+        let configuration = SpeechOutputConfiguration(settings: settings)
+        guard configuration.isReady else {
+            readAloudError =
+                "Set up \(configuration.model.displayName) on the Speech Model page first."
+            return
+        }
+
+        readAloudError = nil
+        isReadAloudPaused = false
+        startReadAloudSegment(from: readAloudWordIndex, configuration: configuration)
+    }
+
+    func stopReadAloud() {
+        guard isReadAloudInProgress
+            || isReadAloudPaused
+            || readAloudTask != nil else {
+            return
+        }
+
+        cancelReadAloudPlayback()
+        isReadAloudPaused = false
+        readAloudWordIndex = 0
+        readAloudSegmentStart = 0
+        isReadAloudFinished = false
+    }
+
+    func clearReadAloudText() {
+        guard !isReadAloudInProgress, !isReadAloudPaused else { return }
+        readAloudText = ""
+        isEditingReadAloudText = false
+        readAloudWordIndex = 0
+        isReadAloudFinished = false
+        readAloudError = nil
+    }
+
+    /// Tears down the running segment without touching the reading position, so
+    /// pause, seek and stop can each decide what the position should become.
+    private func cancelReadAloudPlayback() {
+        readAloudGeneration += 1
+        readAloudTask?.cancel()
+        readAloudTask = nil
+        speechOutputService.stop()
+        isReadAloudInProgress = false
+        isSpeechOutputInProgress = false
+        if status == .processing {
+            status = .idle
+        }
+    }
+
+    private func startReadAloudSegment(
+        from wordIndex: Int,
+        configuration: SpeechOutputConfiguration
+    ) {
+        let segmentText = readAloudDocument.spokenText(from: wordIndex)
+        guard !segmentText.isEmpty else {
+            isReadAloudFinished = true
+            return
+        }
+
+        readAloudTask?.cancel()
+        readAloudGeneration += 1
+        let generation = readAloudGeneration
+        readAloudSegmentStart = wordIndex
+        isReadAloudInProgress = true
+        isSpeechOutputInProgress = true
+        status = .processing
+
+        let task = Task<Void, Never> { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performReadAloud(
+                segmentText,
+                priorPlayedWordCount: wordIndex,
+                configuration: configuration,
+                generation: generation
+            )
+        }
+        readAloudTask = task
+    }
+
+    private func performReadAloud(
+        _ segmentText: String,
+        priorPlayedWordCount: Int,
+        configuration: SpeechOutputConfiguration,
+        generation: Int
+    ) async {
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: String.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        continuation.yield(segmentText)
+        continuation.finish()
+
+        var reachedEnd = false
+
+        do {
+            try await speechOutputService.speakStreamingText(
+                stream,
+                configuration: configuration,
+                onPlaybackText: { [weak self] playedText, isComplete in
+                    guard let self,
+                          generation == readAloudGeneration else {
+                        return
+                    }
+                    let segmentPlayedWordCount =
+                        ReadAloudPlaybackProgress.wordCount(in: playedText)
+                    // Within a segment the position only moves forward; a
+                    // regression means a stale progress callback, and letting it
+                    // through would send the highlight back up the page.
+                    readAloudWordIndex = max(
+                        readAloudWordIndex,
+                        min(
+                            priorPlayedWordCount + segmentPlayedWordCount,
+                            readAloudDocument.wordCount
+                        )
+                    )
+                    if isComplete {
+                        readAloudWordIndex = readAloudDocument.wordCount
+                        isReadAloudFinished = true
+                    }
+                }
+            )
+            reachedEnd = true
+        } catch is CancellationError {
+            // Stopping playback is an expected user action.
+        } catch {
+            guard generation == readAloudGeneration else { return }
+            readAloudError = error.localizedDescription
+        }
+
+        guard generation == readAloudGeneration else { return }
+        if reachedEnd {
+            // The engine may finish without a final progress callback; the
+            // reader must still land on the end of the document.
+            readAloudWordIndex = readAloudDocument.wordCount
+            isReadAloudFinished = true
+        }
+        readAloudTask = nil
+        isReadAloudInProgress = false
+        isReadAloudPaused = false
+        isSpeechOutputInProgress = false
+        if status == .processing {
+            status = .idle
         }
     }
 

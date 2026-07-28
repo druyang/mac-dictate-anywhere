@@ -11,6 +11,12 @@ enum OpenRouterSpeechService {
     private static let baseURL = URL(string: "https://openrouter.ai/api/v1")!
     private static let appAttributionURL = "https://github.com/hoomanaskari/mac-dictate-anywhere"
     private static let appTitle = "Dictate Anywhere"
+    private static let maximumSynthesisAttempts = 2
+
+    typealias SpeechDataLoader =
+        @Sendable (URLRequest) async throws -> (Data, URLResponse)
+    typealias RetrySleeper =
+        @Sendable (TimeInterval) async throws -> Void
 
     struct Model: Identifiable, Hashable, Sendable {
         let id: String
@@ -38,6 +44,7 @@ enum OpenRouterSpeechService {
         case missingVoice
         case invalidResponse
         case emptyResponse
+        case rateLimited(retryAfterSeconds: Int?)
         case serverMessage(String)
         case unexpectedStatus(Int)
 
@@ -51,6 +58,11 @@ enum OpenRouterSpeechService {
                 return "OpenRouter returned an invalid speech response."
             case .emptyResponse:
                 return "OpenRouter returned empty speech audio."
+            case .rateLimited(let retryAfterSeconds):
+                if let retryAfterSeconds {
+                    return "The speech provider is rate-limited. Try again in \(retryAfterSeconds) seconds or choose another speech model."
+                }
+                return "The speech provider is temporarily rate-limited. Wait a moment and try again, or choose another speech model."
             case .serverMessage(let message):
                 return message
             case .unexpectedStatus(let status):
@@ -81,8 +93,15 @@ enum OpenRouterSpeechService {
         model: String,
         voice: String,
         apiKey: String,
-        apiKeyEnvironmentVariable: String
+        apiKeyEnvironmentVariable: String,
+        dataLoader: @escaping SpeechDataLoader = {
+            try await URLSession.shared.data(for: $0)
+        },
+        sleep: @escaping RetrySleeper = {
+            try await Task.sleep(for: .seconds($0))
+        }
     ) async throws -> Data {
+        try Task.checkCancellation()
         let resolvedKey = try OpenRouterPostProcessingService.resolvedAPIKey(
             apiKey: apiKey,
             apiKeyEnvironmentVariable: apiKeyEnvironmentVariable
@@ -93,12 +112,45 @@ enum OpenRouterSpeechService {
             voice: voice,
             apiKey: resolvedKey
         )
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try validate(response: response, data: data)
-        guard !data.isEmpty else {
-            throw ServiceError.emptyResponse
+
+        for attempt in 0..<maximumSynthesisAttempts {
+            try Task.checkCancellation()
+            let (data, response) = try await dataLoader(request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw ServiceError.invalidResponse
+            }
+
+            if shouldRetry(status: httpResponse.statusCode),
+               attempt + 1 < maximumSynthesisAttempts {
+                let delay = retryDelay(
+                    retryAfterHeader:
+                        httpResponse.value(forHTTPHeaderField: "Retry-After")
+                )
+                try await sleep(delay)
+                continue
+            }
+
+            try validate(response: httpResponse, data: data)
+            guard !data.isEmpty else {
+                throw ServiceError.emptyResponse
+            }
+            return data
         }
-        return data
+
+        throw ServiceError.invalidResponse
+    }
+
+    static func retryDelay(
+        retryAfterHeader: String?
+    ) -> TimeInterval {
+        if let retryAfterHeader,
+           let serverDelay = TimeInterval(
+               retryAfterHeader.trimmingCharacters(in: .whitespacesAndNewlines)
+           ),
+           serverDelay > 0 {
+            return serverDelay
+        }
+        return 2
     }
 
     static func makeSpeechRequest(
@@ -220,6 +272,15 @@ enum OpenRouterSpeechService {
             throw ServiceError.invalidResponse
         }
         guard (200..<300).contains(httpResponse.statusCode) else {
+            if httpResponse.statusCode == 429 {
+                let retryAfterSeconds = httpResponse
+                    .value(forHTTPHeaderField: "Retry-After")
+                    .flatMap(TimeInterval.init)
+                    .map { Int($0.rounded(.up)) }
+                throw ServiceError.rateLimited(
+                    retryAfterSeconds: retryAfterSeconds
+                )
+            }
             if let apiError = try? JSONDecoder().decode(ErrorResponse.self, from: data) {
                 let message = apiError.error?.message?.trimmingCharacters(in: .whitespacesAndNewlines)
                     ?? apiError.message?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -230,5 +291,9 @@ enum OpenRouterSpeechService {
             }
             throw ServiceError.unexpectedStatus(httpResponse.statusCode)
         }
+    }
+
+    private static func shouldRetry(status: Int) -> Bool {
+        status == 429 || status == 503
     }
 }

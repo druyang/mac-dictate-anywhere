@@ -275,6 +275,7 @@ enum SpeechSynthesisModel: String, CaseIterable, Codable, Sendable {
     case supertonic3
     case kokoroAne
     case pocketTTS
+    case styleTTS2
     case openRouter
 
     nonisolated var displayName: String {
@@ -282,6 +283,7 @@ enum SpeechSynthesisModel: String, CaseIterable, Codable, Sendable {
         case .supertonic3: return "Supertonic-3"
         case .kokoroAne: return "KokoroAne 82M"
         case .pocketTTS: return "PocketTTS"
+        case .styleTTS2: return "StyleTTS2"
         case .openRouter: return "OpenRouter"
         }
     }
@@ -294,6 +296,8 @@ enum SpeechSynthesisModel: String, CaseIterable, Codable, Sendable {
             return "A compact, fast 82M model with phoneme-based English pronunciation."
         case .pocketTTS:
             return "A streaming-capable model with natural prosody and voice-cloning support."
+        case .styleTTS2:
+            return "An English zero-shot voice model conditioned by a clean reference recording."
         case .openRouter:
             return "Cloud speech through OpenRouter, with a live catalog of speech models and voices."
         }
@@ -304,6 +308,7 @@ enum SpeechSynthesisModel: String, CaseIterable, Codable, Sendable {
         case .supertonic3: return "31 languages"
         case .kokoroAne: return "English"
         case .pocketTTS: return "English pack"
+        case .styleTTS2: return "English"
         case .openRouter: return "Model-dependent"
         }
     }
@@ -311,7 +316,7 @@ enum SpeechSynthesisModel: String, CaseIterable, Codable, Sendable {
     nonisolated var sampleRateSummary: String {
         switch self {
         case .supertonic3: return "44.1 kHz"
-        case .kokoroAne, .pocketTTS: return "24 kHz"
+        case .kokoroAne, .pocketTTS, .styleTTS2: return "24 kHz"
         case .openRouter: return "Cloud"
         }
     }
@@ -321,6 +326,7 @@ enum SpeechSynthesisModel: String, CaseIterable, Codable, Sendable {
         case .supertonic3: return "OpenRAIL++"
         case .kokoroAne: return "Apache 2.0"
         case .pocketTTS: return "CC BY 4.0"
+        case .styleTTS2: return "MIT"
         case .openRouter: return "Usage-based"
         }
     }
@@ -330,6 +336,7 @@ enum SpeechSynthesisModel: String, CaseIterable, Codable, Sendable {
         case .supertonic3: return 199_390_409
         case .kokoroAne: return 186_208_560
         case .pocketTTS: return 454_245_751
+        case .styleTTS2: return 670_000_000
         case .openRouter: return 0
         }
     }
@@ -670,6 +677,8 @@ final class Settings {
     // MARK: - Singleton
 
     static let shared = Settings()
+    nonisolated static let agentMemoryExchangeLimitRange = 5...100
+    nonisolated static let defaultAgentMemoryExchangeLimit = 20
     static let recommendedTranscriptCleanupPrompt = """
     Never use em dashes. Replace them with commas, periods, colons, semicolons, or parentheses when needed.
 
@@ -727,11 +736,14 @@ final class Settings {
         static let agentBrainProvider = "agentBrainProvider"
         static let agentSystemPrompt = "agentSystemPrompt"
         static let agentOpenRouterWebSearchEnabled = "agentOpenRouterWebSearchEnabled"
+        static let agentConversationMemoryEnabled = "agentConversationMemoryEnabled"
+        static let agentMemoryExchangeLimit = "agentMemoryExchangeLimit"
         static let codexToolEnabled = "codexToolEnabled"
         static let codexWorkspacePath = "codexWorkspacePath"
         static let speechSynthesisModel = "speechSynthesisModel"
         static let supertonicVoice = "supertonicVoice"
         static let pocketVoice = "pocketVoice"
+        static let styleTTS2ReferenceAudioPath = "styleTTS2ReferenceAudioPath"
         static let speechOutputLanguage = "speechOutputLanguage"
         static let openRouterSpeechModel = "openRouterSpeechModel"
         static let openRouterSpeechVoice = "openRouterSpeechVoice"
@@ -877,6 +889,29 @@ final class Settings {
         }
     }
 
+    var agentConversationMemoryEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                agentConversationMemoryEnabled,
+                forKey: Keys.agentConversationMemoryEnabled
+            )
+        }
+    }
+
+    var agentMemoryExchangeLimit: Int {
+        didSet {
+            let clampedValue = Self.clampedAgentMemoryExchangeLimit(agentMemoryExchangeLimit)
+            if agentMemoryExchangeLimit != clampedValue {
+                agentMemoryExchangeLimit = clampedValue
+                return
+            }
+            UserDefaults.standard.set(
+                agentMemoryExchangeLimit,
+                forKey: Keys.agentMemoryExchangeLimit
+            )
+        }
+    }
+
     var codexToolEnabled: Bool {
         didSet {
             UserDefaults.standard.set(codexToolEnabled, forKey: Keys.codexToolEnabled)
@@ -904,6 +939,15 @@ final class Settings {
     var pocketVoice: PocketVoiceChoice {
         didSet {
             UserDefaults.standard.set(pocketVoice.rawValue, forKey: Keys.pocketVoice)
+        }
+    }
+
+    var styleTTS2ReferenceAudioPath: String {
+        didSet {
+            UserDefaults.standard.set(
+                styleTTS2ReferenceAudioPath,
+                forKey: Keys.styleTTS2ReferenceAudioPath
+            )
         }
     }
 
@@ -1223,6 +1267,12 @@ final class Settings {
             agentSystemPrompt = VoiceAgentInstructions.system
         }
         agentOpenRouterWebSearchEnabled = migratedOpenRouterWebSearchEnabled
+        agentConversationMemoryEnabled =
+            defaults.object(forKey: Keys.agentConversationMemoryEnabled) as? Bool ?? false
+        agentMemoryExchangeLimit = Self.clampedAgentMemoryExchangeLimit(
+            defaults.object(forKey: Keys.agentMemoryExchangeLimit) as? Int
+                ?? Self.defaultAgentMemoryExchangeLimit
+        )
         codexToolEnabled = defaults.object(forKey: Keys.codexToolEnabled) as? Bool ?? false
         codexWorkspacePath = defaults.string(forKey: Keys.codexWorkspacePath) ?? ""
         speechSynthesisModel = SpeechSynthesisModel(
@@ -1234,6 +1284,8 @@ final class Settings {
         pocketVoice = PocketVoiceChoice(
             rawValue: defaults.string(forKey: Keys.pocketVoice) ?? ""
         ) ?? .alba
+        styleTTS2ReferenceAudioPath =
+            defaults.string(forKey: Keys.styleTTS2ReferenceAudioPath) ?? ""
         speechOutputLanguage = SpeechOutputLanguage(
             rawValue: defaults.string(forKey: Keys.speechOutputLanguage) ?? ""
         ) ?? .english
@@ -1400,6 +1452,10 @@ final class Settings {
         let maxEntries = 50
         guard history.count > maxEntries else { return history }
         return Array(history.suffix(maxEntries))
+    }
+
+    nonisolated static func clampedAgentMemoryExchangeLimit(_ value: Int) -> Int {
+        min(max(value, agentMemoryExchangeLimitRange.lowerBound), agentMemoryExchangeLimitRange.upperBound)
     }
 
     // MARK: - Login Item
