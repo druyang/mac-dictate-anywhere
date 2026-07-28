@@ -46,21 +46,19 @@ struct ReadAloudView: View {
 
                     if showsReader {
                         reader(document: document)
-                        DSDivider()
+                        errorPanel
+                        // No divider: the player bar's own fill and rounded
+                        // bottom already separate it from the page above.
                         ReadAloudPlayerBar(
                             appState: appState,
                             isReady: configuration.isReady
                         )
                     } else if isEditing {
                         composer(configuration: configuration)
+                        errorPanel
                     } else {
                         emptyState(configuration: configuration)
-                    }
-
-                    if let error = appState.readAloudError {
-                        DSDivider()
-                        DSPanel(text: error, tone: .danger)
-                            .padding(DS.Spacing.rowHorizontal)
+                        errorPanel
                     }
                 }
                 .frame(maxHeight: showsReader ? .infinity : nil)
@@ -81,6 +79,17 @@ struct ReadAloudView: View {
         .background(DS.Colors.bgWindow)
         .task {
             appState.speechModelManager.refresh()
+        }
+    }
+
+    /// Sits directly under whichever surface is showing, so the player bar stays
+    /// anchored to the bottom edge of the card.
+    @ViewBuilder
+    private var errorPanel: some View {
+        if let error = appState.readAloudError {
+            DSDivider()
+            DSPanel(text: error, tone: .danger)
+                .padding(DS.Spacing.rowHorizontal)
         }
     }
 
@@ -809,7 +818,16 @@ private struct ReadAloudPlayerBar: View {
         }
         .padding(.vertical, 14)
         .padding(.horizontal, 14)
-        .background(DS.Colors.bgInset)
+        .background {
+            // Follows the card's bottom corners, so the fill can't square off
+            // the corner it sits in — and carries the separation on its own,
+            // without a rule across the top.
+            UnevenRoundedRectangle(
+                bottomLeadingRadius: DS.Radius.card,
+                bottomTrailingRadius: DS.Radius.card
+            )
+            .fill(DS.Colors.bgInset)
+        }
     }
 
     private func remainingLabel(

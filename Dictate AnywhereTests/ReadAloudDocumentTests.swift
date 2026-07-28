@@ -181,6 +181,135 @@ final class ReadAloudDocumentTests: XCTestCase {
         XCTAssertFalse(appState.isEditingReadAloudText)
     }
 
+    // MARK: - Synthesis chunking
+
+    private static func article(sentences: Int) -> String {
+        (1...sentences).map { index in
+            "Sentence number \(index) carries enough ordinary words to stand in for a real paragraph of prose."
+        }
+        .joined(separator: " ")
+    }
+
+    func testChunksCoverTheDocumentExactlyAndInOrder() {
+        let document = ReadAloudDocument(source: Self.article(sentences: 40))
+
+        XCTAssertFalse(document.chunks.isEmpty)
+        XCTAssertEqual(document.chunks.first?.range.lowerBound, 0)
+        XCTAssertEqual(document.chunks.last?.range.upperBound, document.wordCount)
+        for (previous, next) in zip(document.chunks, document.chunks.dropFirst()) {
+            XCTAssertEqual(previous.range.upperBound, next.range.lowerBound)
+        }
+        XCTAssertEqual(
+            document.chunks.map(\.text).joined(separator: " "),
+            document.spokenText()
+        )
+    }
+
+    func testChunkBoundariesDoNotDependOnWherePlaybackStarts() {
+        let document = ReadAloudDocument(source: Self.article(sentences: 40))
+        let secondChunkStart = document.chunks[1].range.lowerBound
+
+        // Seeking to a chunk boundary must reproduce the canonical chunks, byte
+        // for byte — that identity is what makes the cache able to hit.
+        let fromBoundary = document.playbackChunks(from: secondChunkStart)
+        XCTAssertEqual(
+            fromBoundary.map(\.text),
+            Array(document.chunks.dropFirst()).map(\.text)
+        )
+    }
+
+    func testSeekingIntoAChunkCostsOnePartialThenCanonicalChunks() {
+        let document = ReadAloudDocument(source: Self.article(sentences: 40))
+        let target = document.chunks[1].range.lowerBound + 3
+        let planned = document.playbackChunks(from: target)
+
+        // The seek stays exact: playback resumes on the clicked word.
+        XCTAssertEqual(planned.first?.range.lowerBound, target)
+        XCTAssertEqual(
+            planned.map(\.text).joined(separator: " "),
+            document.spokenText(from: target)
+        )
+        // Only the partial is uncacheable; everything after it is canonical.
+        XCTAssertEqual(
+            Array(planned.dropFirst()).map(\.text),
+            Array(document.chunks.dropFirst(2)).map(\.text)
+        )
+    }
+
+    func testChunkingKeepsRequestCountProportionalToLength() {
+        let document = ReadAloudDocument(source: Self.article(sentences: 60))
+        let characters = document.spokenText().count
+
+        // A lead-in chunk plus large batches: far fewer requests than the old
+        // clause-sized chunking, which is what tripped the rate limit.
+        XCTAssertLessThanOrEqual(
+            document.chunks.count,
+            2 + characters / ReadAloudDocument.preferredChunkCharacters
+        )
+        XCTAssertLessThanOrEqual(
+            document.chunks[0].text.count,
+            ReadAloudDocument.maximumChunkCharacters
+        )
+        for chunk in document.chunks.dropFirst().dropLast() {
+            XCTAssertGreaterThanOrEqual(
+                chunk.text.count,
+                ReadAloudDocument.preferredChunkCharacters / 2
+            )
+        }
+    }
+
+    func testChunksStartFastAndNeverExceedTheHardMaximum() {
+        let document = ReadAloudDocument(source: Self.article(sentences: 40))
+
+        XCTAssertLessThanOrEqual(
+            document.chunks[0].text.count,
+            ReadAloudDocument.leadInChunkCharacters
+                + ReadAloudDocument.maximumChunkCharacters
+        )
+        for chunk in document.chunks {
+            XCTAssertLessThanOrEqual(
+                chunk.text.count,
+                ReadAloudDocument.maximumChunkCharacters
+            )
+        }
+    }
+
+    func testOversizedSentenceIsSplitRatherThanSentOversized() {
+        let runOn = Array(repeating: "word", count: 900).joined(separator: " ")
+        let document = ReadAloudDocument(source: runOn)
+
+        XCTAssertGreaterThan(document.chunks.count, 1)
+        for chunk in document.chunks {
+            XCTAssertLessThanOrEqual(
+                chunk.text.count,
+                ReadAloudDocument.maximumChunkCharacters
+            )
+        }
+        XCTAssertEqual(
+            document.chunks.map(\.text).joined(separator: " "),
+            document.spokenText()
+        )
+    }
+
+    func testChunksNeverSplitASentenceWhenItFits() {
+        let document = ReadAloudDocument(source: Self.article(sentences: 40))
+
+        for chunk in document.chunks.dropLast() {
+            XCTAssertTrue(
+                document.sentenceStarts.contains(chunk.range.upperBound)
+                    || chunk.range.upperBound == document.wordCount,
+                "Chunk ending at \(chunk.range.upperBound) cuts mid-sentence."
+            )
+        }
+    }
+
+    func testPlaybackChunksAreEmptyPastTheEndOfTheDocument() {
+        let document = ReadAloudDocument(source: "One two three.")
+
+        XCTAssertTrue(document.playbackChunks(from: 3).isEmpty)
+        XCTAssertTrue(ReadAloudDocument.empty.playbackChunks().isEmpty)
+    }
+
     @MainActor
     func testClearResetsDocumentAndPosition() {
         let appState = AppState()

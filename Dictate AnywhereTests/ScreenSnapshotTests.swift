@@ -51,7 +51,15 @@ final class ScreenSnapshotTests: XCTestCase {
     }
 
     func testDictationModelScreenRenders() { renderWindow(page: .models) }
+    /// The default model is local, so this covers the page with the cloud
+    /// credentials, catalogue and cache row hidden.
     func testSpeechModelScreenRenders() { renderWindow(page: .speechOutput) }
+
+    func testSpeechModelScreenRendersCloudConfiguration() {
+        renderWindow(page: .speechOutput, variant: "openrouter") { appState in
+            appState.settings.speechSynthesisModel = .openRouter
+        }
+    }
     func testReadAloudScreenRenders() { renderWindow(page: .readAloud) }
 
     /// The reader is a different surface from the empty state: word canvas,

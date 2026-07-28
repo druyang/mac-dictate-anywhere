@@ -116,7 +116,16 @@ final class AppState {
     /// reader. It lives here, not in view state, because the window's warning
     /// banners appear and disappear underneath the page — that reshuffles view
     /// identity and would silently drop an in-progress edit.
-    var isEditingReadAloudText = false
+    var isEditingReadAloudText = false {
+        didSet {
+            // Leaving the editor is the moment an edit is final. Sweeping per
+            // keystroke instead would thrash the disk and delete chunks the
+            // reader is halfway through retyping.
+            if oldValue, !isEditingReadAloudText {
+                collectOrphanedSpeechAudio()
+            }
+        }
+    }
     var readAloudError: String?
     var isReadAloudInProgress = false
     var isReadAloudPaused = false
@@ -168,7 +177,15 @@ final class AppState {
     private var agentRequestTask: Task<Void, Never>?
     private var readAloudGeneration = 0
     private var readAloudTask: Task<Void, Never>?
+    private var readAloudSeekTask: Task<Void, Never>?
     private var readAloudSegmentStart = 0
+    /// Chunk texts this session has handed to the speech cache for the current
+    /// document, so the ones an edit strips out can be reclaimed.
+    private var cachedReadAloudChunkTexts: Set<String> = []
+    /// Scrubbing and repeated sentence skips settle before any audio is
+    /// requested. Without it, hunting for a spot fires a synthesis run per
+    /// keypress — the fastest way there is to a rate limit.
+    static let readAloudSeekDebounce = Duration.milliseconds(300)
     private var startupTask: Task<Void, Never>?
     private var hasStarted = false
 
@@ -272,6 +289,12 @@ final class AppState {
         await permissions.check()
         updateAccessibilityIntegration(granted: permissions.accessibilityGranted, promptIfNeeded: true)
         speechModelManager.refresh()
+        // The reader's text does not survive a relaunch, so most of what is on
+        // disk is already unreachable. Reclaim the expired part now rather than
+        // waiting for a future write to trip the size cap.
+        Task.detached {
+            await SpeechAudioCache.shared.sweepExpired()
+        }
         await prepareActiveEngine()
     }
 
@@ -1342,7 +1365,7 @@ final class AppState {
                 "Set up \(configuration.model.displayName) on the Speech Model page first."
             return
         }
-        startReadAloudSegment(from: target, configuration: configuration)
+        scheduleReadAloudSegment(from: target, configuration: configuration)
     }
 
     /// Jumps whole sentences, the way a track skip works: backwards restarts
@@ -1425,12 +1448,47 @@ final class AppState {
         readAloudWordIndex = 0
         isReadAloudFinished = false
         readAloudError = nil
+        collectOrphanedSpeechAudio()
+    }
+
+    /// Drops cached audio for text the reader no longer contains.
+    ///
+    /// Chunks are content-addressed, so an edit only orphans the chunks whose
+    /// text actually changed — the untouched ones keep their keys and stay
+    /// playable. Entries under a previously selected voice are left to the
+    /// cache's own age limit, since switching a voice back is common and
+    /// deleting eagerly there would re-bill a reader for changing their mind.
+    private func collectOrphanedSpeechAudio() {
+        let liveChunkTexts = Set(readAloudDocument.chunks.map(\.text))
+        let orphanedTexts = cachedReadAloudChunkTexts.subtracting(liveChunkTexts)
+        cachedReadAloudChunkTexts = liveChunkTexts
+
+        guard !orphanedTexts.isEmpty else { return }
+        let model = settings.openRouterSpeechModel
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let voice = settings.openRouterSpeechVoice
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty, !voice.isEmpty else { return }
+
+        let keys = orphanedTexts.map { text in
+            SpeechAudioCacheKey(
+                provider: "openrouter",
+                model: model,
+                voice: voice,
+                text: text
+            )
+        }
+        Task {
+            await SpeechAudioCache.shared.remove(keys)
+        }
     }
 
     /// Tears down the running segment without touching the reading position, so
     /// pause, seek and stop can each decide what the position should become.
     private func cancelReadAloudPlayback() {
         readAloudGeneration += 1
+        readAloudSeekTask?.cancel()
+        readAloudSeekTask = nil
         readAloudTask?.cancel()
         readAloudTask = nil
         speechOutputService.stop()
@@ -1441,16 +1499,68 @@ final class AppState {
         }
     }
 
+    /// Moves the reader immediately but delays the audio, so a burst of seeks
+    /// costs one synthesis run instead of one per seek.
+    private func scheduleReadAloudSegment(
+        from wordIndex: Int,
+        configuration: SpeechOutputConfiguration
+    ) {
+        readAloudSeekTask?.cancel()
+        readAloudTask?.cancel()
+        readAloudTask = nil
+        readAloudGeneration += 1
+        let generation = readAloudGeneration
+
+        // The transport keeps showing "playing" across the debounce; only the
+        // request is deferred.
+        readAloudSegmentStart = wordIndex
+        isReadAloudInProgress = true
+        isSpeechOutputInProgress = true
+        status = .processing
+
+        readAloudSeekTask = Task<Void, Never> { @MainActor [weak self] in
+            try? await Task.sleep(for: AppState.readAloudSeekDebounce)
+            guard let self,
+                  !Task.isCancelled,
+                  generation == self.readAloudGeneration else {
+                return
+            }
+            self.readAloudSeekTask = nil
+            self.startReadAloudSegment(from: wordIndex, configuration: configuration)
+        }
+    }
+
     private func startReadAloudSegment(
         from wordIndex: Int,
         configuration: SpeechOutputConfiguration
     ) {
-        let segmentText = readAloudDocument.spokenText(from: wordIndex)
-        guard !segmentText.isEmpty else {
+        // Cloud speech is billed and rate limited per request, so it reads the
+        // document's own stable chunks — identical no matter where playback
+        // started, and therefore already cached on a re-read. Local models pay
+        // nothing per request and want small units for a fast start, so they
+        // keep streaming phrase by phrase.
+        let chunkTexts = configuration.model == .openRouter
+            ? readAloudDocument.playbackChunks(from: wordIndex).map(\.text)
+            : [readAloudDocument.spokenText(from: wordIndex)]
+        guard chunkTexts.contains(where: { !$0.isEmpty }) else {
+            // Reachable after the seek debounce, which has already put the
+            // transport into its playing state — so unwind it here.
             isReadAloudFinished = true
+            isReadAloudInProgress = false
+            isReadAloudPaused = false
+            isSpeechOutputInProgress = false
+            if status == .processing {
+                status = .idle
+            }
             return
         }
 
+        if configuration.model == .openRouter {
+            cachedReadAloudChunkTexts.formUnion(chunkTexts)
+        }
+
+        readAloudSeekTask?.cancel()
+        readAloudSeekTask = nil
         readAloudTask?.cancel()
         readAloudGeneration += 1
         let generation = readAloudGeneration
@@ -1459,10 +1569,12 @@ final class AppState {
         isSpeechOutputInProgress = true
         status = .processing
 
+        let usesDocumentChunks = configuration.model == .openRouter
         let task = Task<Void, Never> { @MainActor [weak self] in
             guard let self else { return }
             await self.performReadAloud(
-                segmentText,
+                chunkTexts,
+                usesDocumentChunks: usesDocumentChunks,
                 priorPlayedWordCount: wordIndex,
                 configuration: configuration,
                 generation: generation
@@ -1472,47 +1584,57 @@ final class AppState {
     }
 
     private func performReadAloud(
-        _ segmentText: String,
+        _ chunkTexts: [String],
+        usesDocumentChunks: Bool,
         priorPlayedWordCount: Int,
         configuration: SpeechOutputConfiguration,
         generation: Int
     ) async {
-        let (stream, continuation) = AsyncStream.makeStream(
-            of: String.self,
-            bufferingPolicy: .bufferingNewest(1)
-        )
-        continuation.yield(segmentText)
-        continuation.finish()
-
         var reachedEnd = false
 
-        do {
-            try await speechOutputService.speakStreamingText(
-                stream,
-                configuration: configuration,
-                onPlaybackText: { [weak self] playedText, isComplete in
-                    guard let self,
-                          generation == readAloudGeneration else {
-                        return
-                    }
-                    let segmentPlayedWordCount =
-                        ReadAloudPlaybackProgress.wordCount(in: playedText)
-                    // Within a segment the position only moves forward; a
-                    // regression means a stale progress callback, and letting it
-                    // through would send the highlight back up the page.
-                    readAloudWordIndex = max(
-                        readAloudWordIndex,
-                        min(
-                            priorPlayedWordCount + segmentPlayedWordCount,
-                            readAloudDocument.wordCount
-                        )
-                    )
-                    if isComplete {
-                        readAloudWordIndex = readAloudDocument.wordCount
-                        isReadAloudFinished = true
-                    }
-                }
+        let onPlaybackText: (String, Bool) -> Void = { [weak self] playedText, isComplete in
+            guard let self,
+                  generation == self.readAloudGeneration else {
+                return
+            }
+            let segmentPlayedWordCount =
+                ReadAloudPlaybackProgress.wordCount(in: playedText)
+            // Within a segment the position only moves forward; a regression
+            // means a stale progress callback, and letting it through would
+            // send the highlight back up the page.
+            self.readAloudWordIndex = max(
+                self.readAloudWordIndex,
+                min(
+                    priorPlayedWordCount + segmentPlayedWordCount,
+                    self.readAloudDocument.wordCount
+                )
             )
+            if isComplete, self.speechOutputService.lastSynthesisWarning == nil {
+                self.readAloudWordIndex = self.readAloudDocument.wordCount
+                self.isReadAloudFinished = true
+            }
+        }
+
+        do {
+            if usesDocumentChunks {
+                try await speechOutputService.speakDocumentChunks(
+                    chunkTexts,
+                    configuration: configuration,
+                    onPlaybackText: onPlaybackText
+                )
+            } else {
+                let (stream, continuation) = AsyncStream.makeStream(
+                    of: String.self,
+                    bufferingPolicy: .bufferingNewest(1)
+                )
+                continuation.yield(chunkTexts.joined(separator: " "))
+                continuation.finish()
+                try await speechOutputService.speakStreamingText(
+                    stream,
+                    configuration: configuration,
+                    onPlaybackText: onPlaybackText
+                )
+            }
             reachedEnd = true
         } catch is CancellationError {
             // Stopping playback is an expected user action.
@@ -1522,6 +1644,24 @@ final class AppState {
         }
 
         guard generation == readAloudGeneration else { return }
+
+        // Synthesis can give out part-way through — a rate limit, a dropped
+        // connection — after the audio already fetched has played. That is a
+        // pause with a reason, not the end of the document: the position stays
+        // on the last word heard so pressing play resumes from there, and the
+        // chunks already bought are served from cache.
+        if let warning = speechOutputService.lastSynthesisWarning {
+            readAloudError = warning
+            isReadAloudInProgress = false
+            isReadAloudPaused = true
+            isSpeechOutputInProgress = false
+            readAloudTask = nil
+            if status == .processing {
+                status = .idle
+            }
+            return
+        }
+
         if reachedEnd {
             // The engine may finish without a final progress callback; the
             // reader must still land on the end of the document.

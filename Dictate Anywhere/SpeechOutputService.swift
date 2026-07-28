@@ -31,24 +31,55 @@ private struct EncodedStreamingSpeechPhrase: Sendable {
     let audio: Data
 }
 
-actor StreamingSynthesisLookaheadGate {
-    private let maximumOutstandingChunks: Int
-    private var outstandingChunks = 0
+/// Paces synthesis by how much audio is already waiting to play, not by how many
+/// chunks are outstanding.
+///
+/// Counting chunks gets both ends wrong: a burst of short chunks fires several
+/// requests in a couple of seconds, while a run of long ones leaves the buffer
+/// barely one chunk deep and stalls playback when a request is slow. Measuring
+/// seconds keeps a steady cushion of audio and naturally settles into roughly
+/// one request per chunk-duration.
+actor SpeechPrefetchBuffer {
+    private let targetBufferedSeconds: Double
+    private let assumedInFlightSeconds: Double
+    private var bufferedSeconds = 0.0
+    private var inFlightRequests = 0
 
-    init(maximumOutstandingChunks: Int) {
-        self.maximumOutstandingChunks = max(maximumOutstandingChunks, 1)
+    init(
+        targetBufferedSeconds: Double = 45,
+        assumedInFlightSeconds: Double = 25
+    ) {
+        self.targetBufferedSeconds = max(targetBufferedSeconds, 1)
+        self.assumedInFlightSeconds = max(assumedInFlightSeconds, 0)
     }
 
-    func acquire() async throws {
-        while outstandingChunks >= maximumOutstandingChunks {
+    /// Blocks until the cushion has room for another chunk. A request already on
+    /// the wire counts against the cushion at an assumed size, so the very first
+    /// chunks cannot all be requested at once.
+    func waitForRoom() async throws {
+        while projectedSeconds >= targetBufferedSeconds {
             try Task.checkCancellation()
-            try await Task.sleep(for: .milliseconds(20))
+            try await Task.sleep(for: .milliseconds(50))
         }
-        outstandingChunks += 1
+        inFlightRequests += 1
     }
 
-    func release() {
-        outstandingChunks = max(outstandingChunks - 1, 0)
+    /// Called once the chunk's real duration is known, at decode time.
+    func didDeliver(seconds: Double) {
+        inFlightRequests = max(inFlightRequests - 1, 0)
+        bufferedSeconds += max(seconds, 0)
+    }
+
+    func didFailToDeliver() {
+        inFlightRequests = max(inFlightRequests - 1, 0)
+    }
+
+    func didPlay(seconds: Double) {
+        bufferedSeconds = max(bufferedSeconds - max(seconds, 0), 0)
+    }
+
+    private var projectedSeconds: Double {
+        bufferedSeconds + Double(inFlightRequests) * assumedInFlightSeconds
     }
 }
 
@@ -118,6 +149,11 @@ final class SpeechOutputService {
     private var streamingSynthesisTask: Task<Void, Never>?
     private var pocketStreamingSession: PocketTtsSession?
     private var requestGeneration = 0
+    /// Set when synthesis failed part-way through but playback of everything
+    /// already fetched went ahead. The caller reports it and leaves the reading
+    /// position where the audio stopped, so a rate limit pauses a reading
+    /// instead of ending it.
+    private(set) var lastSynthesisWarning: String?
     private let streamingTeardownQueue = DispatchQueue(
         label: "com.dictate-anywhere.speech-output-teardown",
         qos: .default
@@ -153,7 +189,8 @@ final class SpeechOutputService {
 
         let wavData = try await synthesize(
             spokenText,
-            configuration: configuration
+            configuration: configuration,
+            cacheScope: .ephemeral
         )
         try Task.checkCancellation()
         guard generation == requestGeneration else {
@@ -163,6 +200,58 @@ final class SpeechOutputService {
             wavData,
             generation: generation,
             onProgress: onPlaybackProgress
+        )
+    }
+
+    /// Plays a document that is already fully known, one precomputed chunk at a
+    /// time.
+    ///
+    /// Unlike `speakStreamingText`, the chunk boundaries here come from the
+    /// caller and do not depend on where playback started, so every chunk after
+    /// a seek is byte-identical to the one a straight read-through would have
+    /// produced — and therefore already paid for.
+    func speakDocumentChunks(
+        _ chunkTexts: [String],
+        configuration: SpeechOutputConfiguration,
+        onPlaybackText: @escaping (String, Bool) -> Void
+    ) async throws {
+        requestGeneration += 1
+        let generation = requestGeneration
+        stopPlayer()
+        lastSynthesisWarning = nil
+
+        let texts = chunkTexts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !texts.isEmpty else { return }
+        guard configuration.model == .openRouter
+            || SpeechModelManager.isDownloaded(configuration.model) else {
+            throw SpeechModelError.modelNotDownloaded(configuration.model)
+        }
+
+        let phrases = AsyncStream<IndexedStreamingSpeechPhrase> { continuation in
+            for (index, text) in texts.enumerated() {
+                continuation.yield(
+                    IndexedStreamingSpeechPhrase(index: index, text: text)
+                )
+            }
+            continuation.finish()
+        }
+        let prefetchBuffer = SpeechPrefetchBuffer()
+        let synthesizedPhrases = makeSynthesizedPhraseStream(
+            phrases,
+            configuration: configuration,
+            generation: generation,
+            prefetchBuffer: prefetchBuffer,
+            allowsPartialCompletion: true,
+            cacheScope: .persistent
+        )
+        try await playBufferedPhrases(
+            synthesizedPhrases,
+            generation: generation,
+            prefetchBuffer: prefetchBuffer,
+            trimsChunkSilence: configuration.model == .openRouter,
+            onPlaybackText: onPlaybackText
         )
     }
 
@@ -310,6 +399,7 @@ final class SpeechOutputService {
         requestGeneration += 1
         let generation = requestGeneration
         stopPlayer()
+        lastSynthesisWarning = nil
 
         guard configuration.model != .pocketTTS else {
             throw SpeechPlaybackError.couldNotPrepare
@@ -323,19 +413,22 @@ final class SpeechOutputService {
             from: cumulativeTextSnapshots,
             coalesceForOpenRouter: configuration.model == .openRouter
         )
-        let lookaheadGate = configuration.model == .openRouter
-            ? StreamingSynthesisLookaheadGate(maximumOutstandingChunks: 2)
+        let prefetchBuffer = configuration.model == .openRouter
+            ? SpeechPrefetchBuffer()
             : nil
         let synthesizedPhrases = makeSynthesizedPhraseStream(
             phrases,
             configuration: configuration,
             generation: generation,
-            lookaheadGate: lookaheadGate
+            prefetchBuffer: prefetchBuffer,
+            allowsPartialCompletion: false,
+            cacheScope: .ephemeral
         )
         try await playBufferedPhrases(
             synthesizedPhrases,
             generation: generation,
-            lookaheadGate: lookaheadGate,
+            prefetchBuffer: prefetchBuffer,
+            trimsChunkSilence: configuration.model == .openRouter,
             onPlaybackText: onPlaybackText
         )
     }
@@ -409,7 +502,9 @@ final class SpeechOutputService {
         _ phrases: AsyncStream<IndexedStreamingSpeechPhrase>,
         configuration: SpeechOutputConfiguration,
         generation: Int,
-        lookaheadGate: StreamingSynthesisLookaheadGate?
+        prefetchBuffer: SpeechPrefetchBuffer?,
+        allowsPartialCompletion: Bool,
+        cacheScope: SpeechAudioCacheScope
     ) -> AsyncThrowingStream<EncodedStreamingSpeechPhrase, Error> {
         AsyncThrowingStream { continuation in
             streamingSynthesisTask?.cancel()
@@ -424,6 +519,7 @@ final class SpeechOutputService {
                     }
                 }
 
+                var yieldedPhraseCount = 0
                 do {
                     try await self.prepareForSynthesis(configuration: configuration)
                     try Task.checkCancellation()
@@ -436,11 +532,18 @@ final class SpeechOutputService {
                         guard generation == self.requestGeneration else {
                             throw CancellationError()
                         }
-                        try await lookaheadGate?.acquire()
-                        let audio = try await self.synthesize(
-                            phrase.text,
-                            configuration: configuration
-                        )
+                        try await prefetchBuffer?.waitForRoom()
+                        let audio: Data
+                        do {
+                            audio = try await self.synthesize(
+                                phrase.text,
+                                configuration: configuration,
+                                cacheScope: cacheScope
+                            )
+                        } catch {
+                            await prefetchBuffer?.didFailToDeliver()
+                            throw error
+                        }
                         continuation.yield(
                             EncodedStreamingSpeechPhrase(
                                 index: phrase.index,
@@ -448,10 +551,22 @@ final class SpeechOutputService {
                                 audio: audio
                             )
                         )
+                        yieldedPhraseCount += 1
                     }
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    // Losing a chunk part-way through a document should not
+                    // throw away the audio already fetched and playing. End the
+                    // stream cleanly and let the caller surface the reason.
+                    guard allowsPartialCompletion,
+                          yieldedPhraseCount > 0,
+                          !(error is CancellationError),
+                          generation == self.requestGeneration else {
+                        continuation.finish(throwing: error)
+                        return
+                    }
+                    self.lastSynthesisWarning = error.localizedDescription
+                    continuation.finish()
                 }
             }
             streamingSynthesisTask = task
@@ -491,7 +606,8 @@ final class SpeechOutputService {
     private func playBufferedPhrases(
         _ phrases: AsyncThrowingStream<EncodedStreamingSpeechPhrase, Error>,
         generation: Int,
-        lookaheadGate: StreamingSynthesisLookaheadGate?,
+        prefetchBuffer: SpeechPrefetchBuffer?,
+        trimsChunkSilence: Bool,
         onPlaybackText: @escaping (String, Bool) -> Void
     ) async throws {
         let playbackState = PocketStreamingPlaybackState()
@@ -521,10 +637,20 @@ final class SpeechOutputService {
                     throw CancellationError()
                 }
 
-                let buffer = try decodeSpeechAudioData(phrase.audio)
+                let decoded = try decodeSpeechAudioData(phrase.audio)
+                // Cloud chunks arrive padded with silence at both ends. Left in,
+                // that padding is the audible gap at every chunk seam — and the
+                // reason large chunks would otherwise sound worse than small
+                // ones rather than better.
+                let buffer = trimsChunkSilence
+                    ? trimmedSpeechSilence(decoded)
+                    : decoded
                 guard buffer.frameLength > 0 else {
                     throw SpeechPlaybackError.couldNotPrepare
                 }
+                await prefetchBuffer?.didDeliver(
+                    seconds: Double(buffer.frameLength) / buffer.format.sampleRate
+                )
 
                 if engine == nil {
                     let createdEngine = AVAudioEngine()
@@ -559,10 +685,10 @@ final class SpeechOutputService {
                     throw SpeechPlaybackError.couldNotPrepare
                 }
 
+                let sampleRate = buffer.format.sampleRate
                 let slices = try speechPCMBufferSlices(buffer)
-                for (sliceIndex, slice) in slices.enumerated() {
+                for slice in slices {
                     let sampleCount = Int64(slice.frameLength)
-                    let isLastSlice = sliceIndex == slices.indices.last
                     playbackState.didSchedule(sampleCount: sampleCount)
                     phraseState.didSchedule(
                         utteranceIndex: utteranceIndex,
@@ -573,9 +699,11 @@ final class SpeechOutputService {
                         completionCallbackType: .dataPlayedBack
                     ) { [weak self] _ in
                         playbackState.didPlay(sampleCount: sampleCount)
-                        if isLastSlice, let lookaheadGate {
+                        if let prefetchBuffer {
                             Task {
-                                await lookaheadGate.release()
+                                await prefetchBuffer.didPlay(
+                                    seconds: Double(sampleCount) / sampleRate
+                                )
                             }
                         }
                         guard let spokenText = phraseState.playbackText(
@@ -685,7 +813,8 @@ final class SpeechOutputService {
 
     private func synthesize(
         _ text: String,
-        configuration: SpeechOutputConfiguration
+        configuration: SpeechOutputConfiguration,
+        cacheScope: SpeechAudioCacheScope
     ) async throws -> Data {
         try Task.checkCancellation()
         switch configuration.model {
@@ -766,7 +895,8 @@ final class SpeechOutputService {
                 model: configuration.openRouterModel,
                 voice: configuration.openRouterVoice,
                 apiKey: configuration.openRouterAPIKey,
-                apiKeyEnvironmentVariable: configuration.openRouterAPIKeyEnvironmentVariable
+                apiKeyEnvironmentVariable: configuration.openRouterAPIKeyEnvironmentVariable,
+                cacheScope: cacheScope
             )
         }
     }
@@ -1040,6 +1170,72 @@ func makePocketStreamingPCMBuffer(from samples: [Float]) throws -> AVAudioPCMBuf
         channelData[0].update(from: baseAddress, count: samples.count)
     }
     return buffer
+}
+
+/// Trims near-silence from both ends of a synthesized chunk, keeping a short
+/// margin so nothing is clipped and consecutive chunks still breathe.
+///
+/// Only ever removes audio: a buffer that is silent throughout, or that has no
+/// detectable padding, comes back untouched.
+@MainActor
+func trimmedSpeechSilence(
+    _ buffer: AVAudioPCMBuffer,
+    marginSeconds: TimeInterval = 0.03
+) -> AVAudioPCMBuffer {
+    let format = buffer.format
+    guard format.commonFormat == .pcmFormatFloat32,
+          !format.isInterleaved,
+          buffer.frameLength > 0,
+          let channels = buffer.floatChannelData else {
+        return buffer
+    }
+
+    let frameCount = Int(buffer.frameLength)
+    let channelCount = Int(format.channelCount)
+
+    var peak: Float = 0
+    for channel in 0..<channelCount {
+        for frame in 0..<frameCount {
+            peak = max(peak, abs(channels[channel][frame]))
+        }
+    }
+    // A conservative floor: loud enough to be padding, quiet enough that real
+    // speech onsets survive.
+    let threshold = max(peak * 0.005, 0.0001)
+    guard peak > threshold else { return buffer }
+
+    func isLoud(_ frame: Int) -> Bool {
+        for channel in 0..<channelCount
+        where abs(channels[channel][frame]) >= threshold {
+            return true
+        }
+        return false
+    }
+
+    guard let firstLoud = (0..<frameCount).first(where: isLoud),
+          let lastLoud = (0..<frameCount).reversed().first(where: isLoud) else {
+        return buffer
+    }
+
+    let margin = max(Int((format.sampleRate * marginSeconds).rounded()), 0)
+    let start = max(firstLoud - margin, 0)
+    let end = min(lastLoud + margin + 1, frameCount)
+    guard end > start, end - start < frameCount else { return buffer }
+
+    guard let trimmed = AVAudioPCMBuffer(
+        pcmFormat: format,
+        frameCapacity: AVAudioFrameCount(end - start)
+    ), let destination = trimmed.floatChannelData else {
+        return buffer
+    }
+    trimmed.frameLength = AVAudioFrameCount(end - start)
+    for channel in 0..<channelCount {
+        destination[channel].update(
+            from: channels[channel].advanced(by: start),
+            count: end - start
+        )
+    }
+    return trimmed
 }
 
 @MainActor
@@ -1354,9 +1550,12 @@ nonisolated enum PocketStreamingPlaybackProgress {
 }
 
 nonisolated struct OpenRouterSpeechChunkAccumulator {
-    private static let immediateChunkCount = 2
-    private static let preferredCharacters = 600
-    private static let maximumCharacters = 900
+    /// One short chunk covers startup latency; batching from there on keeps the
+    /// request count — and the bill — proportional to the text, not the number
+    /// of clause boundaries in it.
+    private static let immediateChunkCount = 1
+    private static let preferredCharacters = 900
+    private static let maximumCharacters = 1_300
 
     private var immediateChunksEmitted = 0
     private var pendingText = ""

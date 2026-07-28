@@ -27,6 +27,26 @@ nonisolated struct ReadAloudDocument: Equatable, Sendable {
         let range: Range<Int>
     }
 
+    /// A unit of synthesis: the span of words handed to the speech engine in one
+    /// request.
+    struct Chunk: Equatable, Sendable, Identifiable {
+        let id: Int
+        let range: Range<Int>
+        let text: String
+    }
+
+    /// Cloud speech is billed per character and limited per minute, so the
+    /// document is cut into chunks once, here, on sentence boundaries. The cut
+    /// points do not depend on where playback starts — that is what makes a
+    /// chunk reusable from cache no matter how the reader seeks around, and what
+    /// keeps a passage sounding the same on every reading.
+    ///
+    /// The first chunk is deliberately short so playback starts quickly; the
+    /// rest are large, because each one is a billed round trip.
+    static let leadInChunkCharacters = 180
+    static let preferredChunkCharacters = 1_100
+    static let maximumChunkCharacters = 1_500
+
     /// Reading pace used for the "about N min left" estimates. Speech models
     /// land between roughly 150 and 180 wpm; the label says "about" for a
     /// reason.
@@ -36,6 +56,8 @@ nonisolated struct ReadAloudDocument: Equatable, Sendable {
     let paragraphs: [Paragraph]
     /// First word index of each sentence, in order.
     let sentenceStarts: [Int]
+    /// Synthesis units covering the whole document, in order and contiguous.
+    let chunks: [Chunk]
 
     static let empty = ReadAloudDocument(source: "")
 
@@ -100,6 +122,68 @@ nonisolated struct ReadAloudDocument: Equatable, Sendable {
         self.words = words
         self.paragraphs = paragraphs
         self.sentenceStarts = sentenceStarts
+        self.chunks = Self.makeChunks(
+            words: words,
+            sentenceStarts: sentenceStarts
+        )
+    }
+
+    /// Greedy fill to the character budget, then extend to the next sentence end
+    /// so a chunk never stops mid-thought. A sentence longer than the hard
+    /// maximum is split on word boundaries rather than sent oversized.
+    static func makeChunks(
+        words: [Word],
+        sentenceStarts: [Int]
+    ) -> [Chunk] {
+        guard !words.isEmpty else { return [] }
+
+        let sentenceStartSet = Set(sentenceStarts)
+        var chunks: [Chunk] = []
+        var start = 0
+
+        while start < words.count {
+            let budget = chunks.isEmpty
+                ? leadInChunkCharacters
+                : preferredChunkCharacters
+            var end = start
+            var length = 0
+            var lastSentenceEnd: Int?
+
+            while end < words.count {
+                let candidate = length == 0
+                    ? words[end].text.count
+                    : length + 1 + words[end].text.count
+                if candidate > maximumChunkCharacters, end > start {
+                    break
+                }
+                length = candidate
+                end += 1
+
+                let isSentenceEnd = end == words.count
+                    || sentenceStartSet.contains(end)
+                if isSentenceEnd {
+                    lastSentenceEnd = end
+                    if length >= budget { break }
+                }
+            }
+
+            let cut = lastSentenceEnd ?? end
+            let range = start..<cut
+            chunks.append(
+                Chunk(
+                    id: chunks.count,
+                    range: range,
+                    text: text(of: words, in: range)
+                )
+            )
+            start = cut
+        }
+
+        return chunks
+    }
+
+    private static func text(of words: [Word], in range: Range<Int>) -> String {
+        words[range].map(\.text).joined(separator: " ")
     }
 
     /// Strips the markdown scaffolding that would otherwise be read out loud
@@ -162,6 +246,37 @@ nonisolated struct ReadAloudDocument: Equatable, Sendable {
         let start = max(wordIndex, 0)
         guard start < words.count else { return "" }
         return words[start...].map(\.text).joined(separator: " ")
+    }
+
+    func chunkIndex(containing wordIndex: Int) -> Int? {
+        guard !chunks.isEmpty else { return nil }
+        let target = max(wordIndex, 0)
+        guard target < words.count else { return nil }
+        return chunks.firstIndex { $0.range.contains(target) }
+    }
+
+    /// Chunks to synthesize for playback starting at `wordIndex`.
+    ///
+    /// Seeking into the middle of a chunk yields one partial chunk covering the
+    /// rest of it, and canonical chunks from there on. That costs at most one
+    /// uncacheable request per seek instead of re-synthesizing the remainder of
+    /// the document, and it keeps the seek exact — playback resumes on the word
+    /// the reader actually clicked, not at the top of its chunk.
+    func playbackChunks(from wordIndex: Int = 0) -> [Chunk] {
+        guard let index = chunkIndex(containing: wordIndex) else { return [] }
+        let start = max(wordIndex, 0)
+        let head = chunks[index]
+
+        guard start > head.range.lowerBound else {
+            return Array(chunks[index...])
+        }
+        let partialRange = start..<head.range.upperBound
+        let partial = Chunk(
+            id: head.id,
+            range: partialRange,
+            text: Self.text(of: words, in: partialRange)
+        )
+        return [partial] + chunks[(index + 1)...]
     }
 
     func clampedWordIndex(_ index: Int) -> Int {

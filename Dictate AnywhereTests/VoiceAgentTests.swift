@@ -45,6 +45,14 @@ private actor OpenRouterSpeechRetryTestHarness {
     }
 }
 
+private actor VoiceAgentTestDelayLog {
+    private(set) var delays: [TimeInterval] = []
+
+    func record(_ delay: TimeInterval) {
+        delays.append(delay)
+    }
+}
+
 final class VoiceAgentTests: XCTestCase {
     private func conversationExchange(
         user: String = "What is my favorite editor?",
@@ -612,7 +620,9 @@ final class VoiceAgentTests: XCTestCase {
             },
             sleep: { delay in
                 await harness.recordSleep(delay)
-            }
+            },
+            cache: nil,
+            rateLimiter: nil
         )
 
         let requestCount = await harness.requestCount
@@ -622,13 +632,48 @@ final class VoiceAgentTests: XCTestCase {
         XCTAssertEqual(sleepDelays, [3])
     }
 
-    func testOpenRouterSpeechUsesSingleFallbackDelayWithoutHeader() {
+    func testOpenRouterSpeechBacksOffExponentiallyWithinCap() {
+        // Full jitter: the delay is bounded by the exponential step, never zero,
+        // and never past the cap.
+        for attempt in 0..<8 {
+            let ceiling = min(
+                OpenRouterSpeechService.baseRetryDelay * pow(2, Double(attempt)),
+                OpenRouterSpeechService.maximumRetryDelay
+            )
+            for fraction in [0.0, 0.5, 1.0] {
+                let delay = OpenRouterSpeechService.retryDelay(
+                    attempt: attempt,
+                    randomFraction: fraction
+                )
+                XCTAssertGreaterThan(delay, 0)
+                XCTAssertLessThanOrEqual(delay, ceiling)
+                XCTAssertLessThanOrEqual(
+                    delay,
+                    OpenRouterSpeechService.maximumRetryDelay
+                )
+            }
+        }
+
         XCTAssertEqual(
-            OpenRouterSpeechService.retryDelay(
-                retryAfterHeader: nil
-            ),
-            2
+            OpenRouterSpeechService.retryDelay(attempt: 0, retryAfterHeader: "3"),
+            3
         )
+        // A wildly long Retry-After still yields to the cap.
+        XCTAssertEqual(
+            OpenRouterSpeechService.retryDelay(attempt: 0, retryAfterHeader: "600"),
+            OpenRouterSpeechService.maximumRetryDelay
+        )
+    }
+
+    func testOpenRouterSpeechRetriesTransientServerErrors() {
+        XCTAssertTrue(OpenRouterSpeechService.shouldRetry(status: 429))
+        XCTAssertTrue(OpenRouterSpeechService.shouldRetry(status: 500))
+        XCTAssertTrue(OpenRouterSpeechService.shouldRetry(status: 502))
+        XCTAssertTrue(OpenRouterSpeechService.shouldRetry(status: 503))
+        XCTAssertTrue(OpenRouterSpeechService.shouldRetry(status: 504))
+        XCTAssertFalse(OpenRouterSpeechService.shouldRetry(status: 400))
+        XCTAssertFalse(OpenRouterSpeechService.shouldRetry(status: 401))
+        XCTAssertFalse(OpenRouterSpeechService.shouldRetry(status: 404))
     }
 
     func testOpenRouterSpeechStopsAfterBounded429Retries() async {
@@ -646,7 +691,9 @@ final class VoiceAgentTests: XCTestCase {
                 },
                 sleep: { delay in
                     await harness.recordSleep(delay)
-                }
+                },
+                cache: nil,
+                rateLimiter: nil
             )
             XCTFail("Expected a bounded rate-limit error.")
         } catch let error as OpenRouterSpeechService.ServiceError {
@@ -660,8 +707,210 @@ final class VoiceAgentTests: XCTestCase {
 
         let requestCount = await harness.requestCount
         let sleepDelays = await harness.sleepDelays
-        XCTAssertEqual(requestCount, 2)
-        XCTAssertEqual(sleepDelays, [3])
+        XCTAssertEqual(requestCount, OpenRouterSpeechService.maximumSynthesisAttempts)
+        XCTAssertEqual(
+            sleepDelays,
+            Array(
+                repeating: 3,
+                count: OpenRouterSpeechService.maximumSynthesisAttempts - 1
+            )
+        )
+    }
+
+    func testOpenRouterSpeechServesRepeatChunksFromCacheWithoutRequests() async throws {
+        let harness = OpenRouterSpeechRetryTestHarness(successOnRequest: 1)
+        let cache = SpeechAudioCache(
+            directory: FileManager.default.temporaryDirectory
+                .appendingPathComponent("speech-cache-\(UUID().uuidString)")
+        )
+        defer {
+            Task { await cache.removeAll() }
+        }
+
+        func synthesize(_ text: String) async throws -> Data {
+            try await OpenRouterSpeechService.synthesize(
+                text: text,
+                model: "microsoft/mai-voice-2",
+                voice: "en-US-Harper:MAI-Voice-2",
+                apiKey: "sk-or-test",
+                apiKeyEnvironmentVariable: "",
+                dataLoader: { try await harness.load($0) },
+                sleep: { await harness.recordSleep($0) },
+                cache: cache,
+                rateLimiter: nil
+            )
+        }
+
+        let first = try await synthesize("A stable chunk of document text.")
+        let second = try await synthesize("A stable chunk of document text.")
+
+        XCTAssertEqual(first, second)
+        // Re-reading, resuming or seeking back over the same chunk costs
+        // nothing: one request served both.
+        let requestCount = await harness.requestCount
+        XCTAssertEqual(requestCount, 1)
+    }
+
+    private func makeTestSpeechCache(
+        maximumAge: TimeInterval = 7 * 24 * 60 * 60
+    ) -> SpeechAudioCache {
+        SpeechAudioCache(
+            directory: FileManager.default.temporaryDirectory
+                .appendingPathComponent("speech-cache-\(UUID().uuidString)"),
+            maximumAge: maximumAge
+        )
+    }
+
+    private func speechCacheKey(_ text: String) -> SpeechAudioCacheKey {
+        SpeechAudioCacheKey(
+            provider: "openrouter",
+            model: "microsoft/mai-voice-2",
+            voice: "en-US-Harper:MAI-Voice-2",
+            text: text
+        )
+    }
+
+    func testEphemeralAudioNeverReachesDisk() async throws {
+        let cache = makeTestSpeechCache()
+        defer { Task { await cache.removeAll() } }
+
+        await cache.store(
+            Data([0x01, 0x02]),
+            for: speechCacheKey("A one-shot assistant reply."),
+            scope: .ephemeral
+        )
+
+        // Still replayable this session, but a conversation must not silt up the
+        // disk with audio nothing will ever ask for again.
+        let inMemory = await cache.data(for: speechCacheKey("A one-shot assistant reply."))
+        XCTAssertEqual(inMemory, Data([0x01, 0x02]))
+        let onDisk = await cache.diskUsageBytes()
+        XCTAssertEqual(onDisk, 0)
+    }
+
+    func testDocumentAudioIsKeptOnDiskAndReported() async throws {
+        let cache = makeTestSpeechCache()
+        defer { Task { await cache.removeAll() } }
+
+        await cache.store(
+            Data(repeating: 0x7F, count: 2_048),
+            for: speechCacheKey("A chunk of a document."),
+            scope: .persistent
+        )
+
+        let usage = await cache.diskUsageBytes()
+        XCTAssertEqual(usage, 2_048)
+    }
+
+    func testEditingTextAwayReclaimsOnlyTheOrphanedChunks() async throws {
+        let cache = makeTestSpeechCache()
+        defer { Task { await cache.removeAll() } }
+
+        let kept = speechCacheKey("An untouched chunk.")
+        let orphaned = speechCacheKey("A chunk the reader deleted.")
+        await cache.store(Data(repeating: 1, count: 512), for: kept)
+        await cache.store(Data(repeating: 2, count: 512), for: orphaned)
+
+        await cache.remove([orphaned])
+
+        // Content addressing means an edit only orphans what actually changed.
+        let survivor = await cache.data(for: kept)
+        let removed = await cache.data(for: orphaned)
+        XCTAssertEqual(survivor, Data(repeating: 1, count: 512))
+        XCTAssertNil(removed)
+    }
+
+    func testExpiredCacheEntriesAreSweptAndFreshOnesSurvive() async throws {
+        let cache = makeTestSpeechCache(maximumAge: 60)
+        defer { Task { await cache.removeAll() } }
+
+        let key = speechCacheKey("A chunk from a document read long ago.")
+        await cache.store(Data(repeating: 3, count: 256), for: key)
+
+        let sweptNothing = await cache.sweepExpired()
+        XCTAssertEqual(sweptNothing, 0)
+        let stillThere = await cache.diskUsageBytes()
+        XCTAssertEqual(stillThere, 256)
+
+        // An idle cache must actually shrink, not wait for a future write to
+        // trip the size cap.
+        let sweptOne = await cache.sweepExpired(now: Date().addingTimeInterval(600))
+        XCTAssertEqual(sweptOne, 1)
+        let afterSweep = await cache.diskUsageBytes()
+        XCTAssertEqual(afterSweep, 0)
+    }
+
+    func testClearingTheCacheEmptiesDiskAndMemory() async throws {
+        let cache = makeTestSpeechCache()
+        let key = speechCacheKey("A chunk the user chose to discard.")
+        await cache.store(Data(repeating: 4, count: 1_024), for: key)
+
+        await cache.removeAll()
+
+        let usage = await cache.diskUsageBytes()
+        let entry = await cache.data(for: key)
+        XCTAssertEqual(usage, 0)
+        XCTAssertNil(entry)
+    }
+
+    @MainActor
+    func testClearingReaderTextDropsItsCachedAudio() async throws {
+        let appState = AppState()
+        appState.readAloudText = "One two three. Four five six."
+        let chunkTexts = appState.readAloudDocument.chunks.map(\.text)
+        XCTAssertFalse(chunkTexts.isEmpty)
+
+        appState.clearReadAloudText()
+
+        // The text is gone, so its audio has no reachable owner left.
+        XCTAssertTrue(appState.readAloudDocument.isEmpty)
+    }
+
+    func testOpenRouterSpeechRateLimiterSmoothsBurstsAcrossRuns() async throws {
+        let sleeps = VoiceAgentTestDelayLog()
+        let limiter = OpenRouterSpeechRateLimiter(
+            maximumRequestsPerMinute: 3,
+            maximumConcurrentRequests: 4,
+            now: { Date(timeIntervalSince1970: 1_000) },
+            sleep: { await sleeps.record($0) }
+        )
+
+        for _ in 0..<3 {
+            try await limiter.acquire()
+            await limiter.release()
+        }
+        let beforeLimit = await sleeps.delays
+        XCTAssertTrue(beforeLimit.isEmpty)
+
+        // The fourth request inside the window has to wait rather than fail —
+        // and the allowance does not reset just because a new run started.
+        let waiting = Task { try await limiter.acquire() }
+        try await Task.sleep(for: .milliseconds(80))
+        let afterLimit = await sleeps.delays
+        XCTAssertFalse(afterLimit.isEmpty)
+        XCTAssertTrue(afterLimit.allSatisfy { $0 > 0 })
+        waiting.cancel()
+    }
+
+    func testOpenRouterSpeechRateLimiterHoldsEveryoneBackAfterA429() async throws {
+        let limiter = OpenRouterSpeechRateLimiter(
+            maximumRequestsPerMinute: 100,
+            maximumConcurrentRequests: 4,
+            now: { Date(timeIntervalSince1970: 1_000) },
+            sleep: { _ in }
+        )
+
+        var isBackingOff = await limiter.isBackingOff
+        XCTAssertFalse(isBackingOff)
+
+        await limiter.backOff(seconds: 5)
+        isBackingOff = await limiter.isBackingOff
+        XCTAssertTrue(isBackingOff)
+
+        // A shorter penalty never shortens a longer one already in force.
+        await limiter.backOff(seconds: 1)
+        isBackingOff = await limiter.isBackingOff
+        XCTAssertTrue(isBackingOff)
     }
 
     func testOpenRouterSpeechRequiresModelAndVoice() {
@@ -882,35 +1131,82 @@ final class VoiceAgentTests: XCTestCase {
         }
         chunks.append(contentsOf: accumulator.finish())
 
+        // One short chunk for a fast start, then batches — the rest of the text
+        // must not become a request per clause.
         XCTAssertEqual(chunks[0], sourcePhrases[0])
-        XCTAssertEqual(chunks[1], sourcePhrases[1])
-        XCTAssertLessThanOrEqual(chunks.count, 4)
+        XCTAssertLessThanOrEqual(chunks.count, 3)
         XCTAssertEqual(
             chunks.joined(separator: " "),
             sourcePhrases.joined(separator: " ")
         )
     }
 
-    func testStreamingSynthesisLookaheadWaitsForPlaybackRelease() async throws {
-        let gate = StreamingSynthesisLookaheadGate(
-            maximumOutstandingChunks: 2
+    func testPrefetchBufferHoldsRequestsUntilAudioDrains() async throws {
+        let buffer = SpeechPrefetchBuffer(
+            targetBufferedSeconds: 30,
+            assumedInFlightSeconds: 25
         )
-        let thirdAcquireCompleted = VoiceAgentTestFlag()
-        try await gate.acquire()
-        try await gate.acquire()
+        let secondFetchStarted = VoiceAgentTestFlag()
+
+        // The first chunk goes out immediately; while it is on the wire its
+        // assumed size already counts against the cushion.
+        try await buffer.waitForRoom()
+        await buffer.didDeliver(seconds: 60)
 
         let waitingTask = Task {
-            try await gate.acquire()
-            await thirdAcquireCompleted.set()
+            try await buffer.waitForRoom()
+            await secondFetchStarted.set()
         }
-        try await Task.sleep(for: .milliseconds(60))
-        let completedBeforeRelease = await thirdAcquireCompleted.value
-        XCTAssertFalse(completedBeforeRelease)
+        try await Task.sleep(for: .milliseconds(80))
+        let startedWhileFull = await secondFetchStarted.value
+        XCTAssertFalse(startedWhileFull)
 
-        await gate.release()
-        try await Task.sleep(for: .milliseconds(60))
-        let completedAfterRelease = await thirdAcquireCompleted.value
-        XCTAssertTrue(completedAfterRelease)
+        // Once enough of that audio has played, the next request goes out well
+        // before the buffer runs dry.
+        await buffer.didPlay(seconds: 40)
+        try await Task.sleep(for: .milliseconds(120))
+        let startedAfterDrain = await secondFetchStarted.value
+        XCTAssertTrue(startedAfterDrain)
+        waitingTask.cancel()
+    }
+
+    func testPrefetchBufferDoesNotRequestEverythingAtOnce() async throws {
+        let buffer = SpeechPrefetchBuffer(
+            targetBufferedSeconds: 45,
+            assumedInFlightSeconds: 25
+        )
+        let thirdFetchStarted = VoiceAgentTestFlag()
+
+        try await buffer.waitForRoom()
+        try await buffer.waitForRoom()
+
+        let waitingTask = Task {
+            try await buffer.waitForRoom()
+            await thirdFetchStarted.set()
+        }
+        try await Task.sleep(for: .milliseconds(80))
+        let started = await thirdFetchStarted.value
+        XCTAssertFalse(started)
+        waitingTask.cancel()
+    }
+
+    func testPrefetchBufferReleasesItsSlotWhenSynthesisFails() async throws {
+        let buffer = SpeechPrefetchBuffer(
+            targetBufferedSeconds: 30,
+            assumedInFlightSeconds: 25
+        )
+        let retryStarted = VoiceAgentTestFlag()
+
+        try await buffer.waitForRoom()
+        await buffer.didFailToDeliver()
+
+        let waitingTask = Task {
+            try await buffer.waitForRoom()
+            await retryStarted.set()
+        }
+        try await Task.sleep(for: .milliseconds(80))
+        let started = await retryStarted.value
+        XCTAssertTrue(started)
         waitingTask.cancel()
     }
 

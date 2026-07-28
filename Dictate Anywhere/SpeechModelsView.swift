@@ -18,6 +18,8 @@ struct SpeechModelsView: View {
     @State private var openRouterSearch = ""
     @State private var isRefreshingOpenRouter = false
     @State private var isChoosingStyleTTS2Reference = false
+    @State private var cachedSpeechAudioBytes = 0
+    @State private var isClearingSpeechAudioCache = false
 
     var body: some View {
         @Bindable var settings = appState.settings
@@ -83,19 +85,30 @@ struct SpeechModelsView: View {
                 }
             }
 
-            openRouterConfiguration(settings: settings)
+            // Credentials, the cloud model catalogue and the shared-key notice
+            // are only ever actionable for a cloud voice. A local voice needs
+            // none of them, so it should not have to read past them.
+            if selectedModel == .openRouter {
+                openRouterConfiguration(settings: settings)
+            }
 
             if let error = manager.errorMessage {
                 DSPanel(text: error, tone: .danger)
             }
 
-            DSPanel(
-                text: "OpenRouter uses the same Keychain-backed API key everywhere in Dictate Anywhere. Changing it here also changes it for Voice Assistant and Transcript Cleanup.",
-                tone: .info
-            )
+            if selectedModel == .openRouter {
+                DSPanel(
+                    text: "OpenRouter uses the same Keychain-backed API key everywhere in Dictate Anywhere. Changing it here also changes it for Voice Assistant and Transcript Cleanup.",
+                    tone: .info
+                )
+            }
         }
-        .task {
+        // Re-runs on selection change, so switching to the cloud voice loads the
+        // catalogue then — rather than fetching it for someone who never leaves
+        // a local model.
+        .task(id: selectedModel) {
             manager.refresh()
+            guard selectedModel == .openRouter else { return }
             await refreshOpenRouterModels()
         }
         .fileImporter(
@@ -290,6 +303,9 @@ struct SpeechModelsView: View {
             .padding(.vertical, 14)
             .padding(.horizontal, DS.Spacing.rowHorizontal)
 
+            DSDivider()
+            speechAudioCacheRow
+
             if !openRouterModels.isEmpty {
                 DSDivider()
                 VStack(alignment: .leading, spacing: 10) {
@@ -314,6 +330,52 @@ struct SpeechModelsView: View {
                 .padding(DS.Spacing.rowHorizontal)
             }
         }
+    }
+
+    /// Cloud speech is paid for once and replayed from disk. That saving is
+    /// invisible unless the cache is, so it gets a size and a way out.
+    private var speechAudioCacheRow: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Cached Speech Audio")
+                    .font(DS.Fonts.ui(13))
+                    .foregroundStyle(DS.Colors.ink)
+                Text(speechAudioCacheDescription)
+                    .font(DS.Fonts.ui(12.5))
+                    .foregroundStyle(DS.Colors.textSecondary)
+            }
+            Spacer(minLength: 12)
+            Button(isClearingSpeechAudioCache ? "Clearing…" : "Clear Cache") {
+                isClearingSpeechAudioCache = true
+                Task {
+                    await SpeechAudioCache.shared.removeAll()
+                    await refreshSpeechAudioCacheSize()
+                    isClearingSpeechAudioCache = false
+                }
+            }
+            .buttonStyle(.dsSecondary)
+            .disabled(isClearingSpeechAudioCache || cachedSpeechAudioBytes == 0)
+        }
+        .padding(.vertical, 14)
+        .padding(.horizontal, DS.Spacing.rowHorizontal)
+        .task {
+            await refreshSpeechAudioCacheSize()
+        }
+    }
+
+    private var speechAudioCacheDescription: String {
+        guard cachedSpeechAudioBytes > 0 else {
+            return "Nothing cached. Audio you have already paid for is reused when you pause, seek or re-read."
+        }
+        let size = ByteCountFormatter.string(
+            fromByteCount: Int64(cachedSpeechAudioBytes),
+            countStyle: .file
+        )
+        return "\(size) reused instead of re-synthesized. Cleared automatically after a week, or when you edit the text away."
+    }
+
+    private func refreshSpeechAudioCacheSize() async {
+        cachedSpeechAudioBytes = await SpeechAudioCache.shared.diskUsageBytes()
     }
 
     @ViewBuilder

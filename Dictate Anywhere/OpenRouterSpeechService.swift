@@ -11,7 +11,9 @@ enum OpenRouterSpeechService {
     private static let baseURL = URL(string: "https://openrouter.ai/api/v1")!
     private static let appAttributionURL = "https://github.com/hoomanaskari/mac-dictate-anywhere"
     private static let appTitle = "Dictate Anywhere"
-    private static let maximumSynthesisAttempts = 2
+    static let maximumSynthesisAttempts = 5
+    static let baseRetryDelay: TimeInterval = 1
+    static let maximumRetryDelay: TimeInterval = 30
 
     typealias SpeechDataLoader =
         @Sendable (URLRequest) async throws -> (Data, URLResponse)
@@ -99,7 +101,10 @@ enum OpenRouterSpeechService {
         },
         sleep: @escaping RetrySleeper = {
             try await Task.sleep(for: .seconds($0))
-        }
+        },
+        cache: SpeechAudioCache? = .shared,
+        cacheScope: SpeechAudioCacheScope = .persistent,
+        rateLimiter: OpenRouterSpeechRateLimiter? = .shared
     ) async throws -> Data {
         try Task.checkCancellation()
         let resolvedKey = try OpenRouterPostProcessingService.resolvedAPIKey(
@@ -113,44 +118,109 @@ enum OpenRouterSpeechService {
             apiKey: resolvedKey
         )
 
+        // Identical audio is never bought twice. Read Aloud cuts a document into
+        // stable chunks, so pausing, resuming and seeking backwards all land on
+        // text that has already been synthesized.
+        let cacheKey = SpeechAudioCacheKey(
+            provider: "openrouter",
+            model: model.trimmingCharacters(in: .whitespacesAndNewlines),
+            voice: voice.trimmingCharacters(in: .whitespacesAndNewlines),
+            text: text
+        )
+        if let cached = await cache?.data(for: cacheKey) {
+            return cached
+        }
+
         for attempt in 0..<maximumSynthesisAttempts {
             try Task.checkCancellation()
-            let (data, response) = try await dataLoader(request)
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw ServiceError.invalidResponse
-            }
+            let isFinalAttempt = attempt + 1 >= maximumSynthesisAttempts
 
-            if shouldRetry(status: httpResponse.statusCode),
-               attempt + 1 < maximumSynthesisAttempts {
-                let delay = retryDelay(
-                    retryAfterHeader:
-                        httpResponse.value(forHTTPHeaderField: "Retry-After")
-                )
-                try await sleep(delay)
-                continue
+            try await rateLimiter?.acquire()
+            let outcome: Result<(Data, URLResponse), Error>
+            do {
+                outcome = .success(try await dataLoader(request))
+            } catch {
+                outcome = .failure(error)
             }
+            await rateLimiter?.release()
 
-            try validate(response: httpResponse, data: data)
-            guard !data.isEmpty else {
-                throw ServiceError.emptyResponse
+            switch outcome {
+            case .failure(let error):
+                if error is CancellationError {
+                    throw error
+                }
+                guard isTransient(error), !isFinalAttempt else {
+                    throw error
+                }
+                try await sleep(retryDelay(attempt: attempt))
+
+            case .success(let (data, response)):
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw ServiceError.invalidResponse
+                }
+
+                if shouldRetry(status: httpResponse.statusCode) {
+                    let delay = retryDelay(
+                        attempt: attempt,
+                        retryAfterHeader:
+                            httpResponse.value(forHTTPHeaderField: "Retry-After")
+                    )
+                    if httpResponse.statusCode == 429
+                        || httpResponse.statusCode == 503 {
+                        await rateLimiter?.backOff(seconds: delay)
+                    }
+                    if !isFinalAttempt {
+                        try await sleep(delay)
+                        continue
+                    }
+                }
+
+                // Throws the provider's own error for a final failed attempt.
+                try validate(response: httpResponse, data: data)
+                guard !data.isEmpty else {
+                    throw ServiceError.emptyResponse
+                }
+                await cache?.store(data, for: cacheKey, scope: cacheScope)
+                return data
             }
-            return data
         }
 
         throw ServiceError.invalidResponse
     }
 
+    /// Exponential backoff with full jitter, capped, and always yielding to the
+    /// provider's own `Retry-After`. The jitter matters because a document's
+    /// chunks would otherwise retry in lockstep and re-trip the same limit.
     static func retryDelay(
-        retryAfterHeader: String?
+        attempt: Int,
+        retryAfterHeader: String? = nil,
+        randomFraction: Double = Double.random(in: 0...1)
     ) -> TimeInterval {
         if let retryAfterHeader,
            let serverDelay = TimeInterval(
                retryAfterHeader.trimmingCharacters(in: .whitespacesAndNewlines)
            ),
            serverDelay > 0 {
-            return serverDelay
+            return min(serverDelay, maximumRetryDelay)
         }
-        return 2
+
+        let exponential = min(
+            baseRetryDelay * pow(2, Double(max(attempt, 0))),
+            maximumRetryDelay
+        )
+        let jittered = exponential * min(max(randomFraction, 0), 1)
+        return max(jittered, baseRetryDelay / 2)
+    }
+
+    private static func isTransient(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .timedOut, .networkConnectionLost, .cannotConnectToHost,
+             .dnsLookupFailed, .resourceUnavailable, .notConnectedToInternet:
+            return true
+        default:
+            return false
+        }
     }
 
     static func makeSpeechRequest(
@@ -293,7 +363,7 @@ enum OpenRouterSpeechService {
         }
     }
 
-    private static func shouldRetry(status: Int) -> Bool {
-        status == 429 || status == 503
+    static func shouldRetry(status: Int) -> Bool {
+        [408, 425, 429, 500, 502, 503, 504].contains(status)
     }
 }
