@@ -553,6 +553,18 @@ private struct RawInputSourceMapping: Decodable {
     let language: String
 }
 
+/// One user-configured app (by bundle identifier) → cleanup-prompt mapping.
+/// The prompt fully replaces whichever post-processing provider's global
+/// prompt is active when the bundle identifier matches the frontmost app at
+/// dictation time — never appended, never provider-specific.
+struct AppPromptMapping: Codable, Identifiable, Equatable {
+    var id: UUID
+    var bundleIdentifier: String
+    /// Cached for display even when the app isn't currently running.
+    var appName: String
+    var prompt: String
+}
+
 struct TranscriptHistoryEntry: Identifiable, Codable, Equatable {
     let id: UUID
     let text: String
@@ -622,6 +634,35 @@ final class Settings {
 
     Treat custom vocabulary as a strong hint, not a hard rule. If a suggested term does not semantically fit the sentence, prefer the wording that best matches the surrounding context.
     """
+    /// Shipped on first launch so per-app prompts are useful with zero
+    /// configuration. Purely a seed value — every row is user-editable and
+    /// deletable afterward like any other mapping.
+    nonisolated static let preloadedAppPromptMappings: [AppPromptMapping] = [
+        AppPromptMapping(
+            id: UUID(),
+            bundleIdentifier: "com.apple.MobileSMS",
+            appName: "Messages",
+            prompt: "Write like a text message: casual and conversational. Contractions are fine, and you don't need every sentence to end with a period. Keep it brief and to the point."
+        ),
+        AppPromptMapping(
+            id: UUID(),
+            bundleIdentifier: "com.tinyspeck.slackmacgap",
+            appName: "Slack",
+            prompt: "Write in a casual, professional workplace tone. Short sentences are fine, and you don't need a greeting or sign-off. Light, natural punctuation."
+        ),
+        AppPromptMapping(
+            id: UUID(),
+            bundleIdentifier: "com.apple.mail",
+            appName: "Mail",
+            prompt: "Write in a polished, professional email tone. Use complete sentences and proper grammar. If the dictation reads like a full email, include an appropriate greeting and sign-off."
+        ),
+        AppPromptMapping(
+            id: UUID(),
+            bundleIdentifier: "com.microsoft.VSCode",
+            appName: "VS Code",
+            prompt: "Preserve code identifiers, file paths, and technical terms exactly as spoken — do not autocorrect or rewrite them. Keep the result terse, like a code comment or commit message. No filler words."
+        ),
+    ]
     private nonisolated static let functionKeyCodes: Set<UInt16> = [63, 179]
     private nonisolated static let openRouterAPIKeyKeychainAccount = "openrouter-api-key"
     private nonisolated static let openAICompatibleAPIKeyKeychainAccount = "openai-compatible-api-key"
@@ -809,6 +850,18 @@ final class Settings {
                 language: language
             )
         }
+    }
+
+    // MARK: - App Prompts
+
+    /// Resolves the array to persist and expose at launch: the preloaded
+    /// samples when no value has ever been stored (`data == nil`, i.e. this
+    /// key has never been written), the decoded array otherwise — including
+    /// an intentionally empty array a user saved by deleting every rule.
+    /// Undecodable data falls back to empty, matching `sanitizedMappings(from:)`.
+    nonisolated static func resolvedAppPromptMappings(from data: Data?) -> [AppPromptMapping] {
+        guard let data else { return preloadedAppPromptMappings }
+        return (try? JSONDecoder().decode([AppPromptMapping].self, from: data)) ?? []
     }
 
     // MARK: - Filler Word Removal
