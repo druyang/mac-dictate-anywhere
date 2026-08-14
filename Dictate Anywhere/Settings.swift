@@ -714,6 +714,8 @@ final class Settings {
         static let openAICompatiblePostProcessingPrompt = "openAICompatiblePostProcessingPrompt"
         static let inputSourceMappings = "inputSourceMappings"
         static let inputSourceAutoSwitchEnabled = "inputSourceAutoSwitchEnabled"
+        static let appPromptMappings = "appPromptMappings"
+        static let appPromptMappingEnabled = "appPromptMappingEnabled"
         static let pendingVocabularyModeRestore = "pendingVocabularyModeRestore"
     }
 
@@ -862,6 +864,19 @@ final class Settings {
     nonisolated static func resolvedAppPromptMappings(from data: Data?) -> [AppPromptMapping] {
         guard let data else { return preloadedAppPromptMappings }
         return (try? JSONDecoder().decode([AppPromptMapping].self, from: data)) ?? []
+    }
+
+    var appPromptMappings: [AppPromptMapping] {
+        didSet {
+            guard let data = try? JSONEncoder().encode(appPromptMappings) else { return }
+            UserDefaults.standard.set(data, forKey: Keys.appPromptMappings)
+        }
+    }
+
+    var appPromptMappingEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(appPromptMappingEnabled, forKey: Keys.appPromptMappingEnabled)
+        }
     }
 
     // MARK: - Filler Word Removal
@@ -1178,6 +1193,10 @@ final class Settings {
         inputSourceAutoSwitchEnabled = defaults.object(forKey: Keys.inputSourceAutoSwitchEnabled) as? Bool ?? false
         pendingVocabularyModeRestore = defaults.object(forKey: Keys.pendingVocabularyModeRestore) as? Bool ?? false
 
+        // App prompts
+        appPromptMappings = Self.resolvedAppPromptMappings(from: defaults.data(forKey: Keys.appPromptMappings))
+        appPromptMappingEnabled = defaults.object(forKey: Keys.appPromptMappingEnabled) as? Bool ?? true
+
         // Filler words
         isFillerWordRemovalEnabled = defaults.object(forKey: Keys.isFillerWordRemovalEnabled) as? Bool ?? false
         fillerWordsToRemove = defaults.object(forKey: Keys.fillerWordsToRemove) as? [String] ?? Self.defaultFillerWords
@@ -1418,6 +1437,33 @@ final class Settings {
 
     func mapping(forInputSourceID id: String) -> InputSourceMapping? {
         inputSourceMappings.first { $0.inputSourceID == id }
+    }
+
+    // MARK: - App Prompt Mapping Helpers
+
+    /// Adds a mapping for a not-yet-mapped bundle identifier with an empty
+    /// prompt, ready for the user to fill in. Returns nil (no-op) if a
+    /// mapping for this app already exists — one rule per app.
+    @discardableResult
+    func addAppPromptMapping(bundleIdentifier: String, appName: String) -> AppPromptMapping? {
+        guard !appPromptMappings.contains(where: { $0.bundleIdentifier == bundleIdentifier }) else { return nil }
+        let mapping = AppPromptMapping(
+            id: UUID(),
+            bundleIdentifier: bundleIdentifier,
+            appName: appName,
+            prompt: ""
+        )
+        appPromptMappings.append(mapping)
+        return mapping
+    }
+
+    func updateAppPromptMapping(_ mapping: AppPromptMapping) {
+        guard let index = appPromptMappings.firstIndex(where: { $0.id == mapping.id }) else { return }
+        appPromptMappings[index] = mapping
+    }
+
+    func removeAppPromptMapping(id: UUID) {
+        appPromptMappings.removeAll { $0.id == id }
     }
 
     /// Call right after an auto-switch may have driven the `parakeetModelChoice`
