@@ -712,13 +712,19 @@ final class AppState {
                 )
             }
         case .appleIntelligence:
-            if !settings.aiPostProcessingPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let prompt = AppPromptResolver.resolve(
+                bundleIdentifier: insertionTargetApp?.bundleIdentifier,
+                mappings: settings.appPromptMappings,
+                enabled: settings.appPromptMappingEnabled,
+                fallback: settings.aiPostProcessingPrompt
+            )
+            if !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 if #available(macOS 26, *) {
                     if case .available = AIPostProcessingService.availability {
                         do {
                             processedText = try await AIPostProcessingService.process(
                                 text: finalText,
-                                prompt: settings.aiPostProcessingPrompt,
+                                prompt: prompt,
                                 vocabulary: settings.customVocabulary
                             )
                         } catch {
@@ -732,24 +738,36 @@ final class AppState {
                 logger.info("postProcessing: Apple Intelligence skipped because prompt is empty")
             }
         case .ollama:
+            let prompt = AppPromptResolver.resolve(
+                bundleIdentifier: insertionTargetApp?.bundleIdentifier,
+                mappings: settings.appPromptMappings,
+                enabled: settings.appPromptMappingEnabled,
+                fallback: settings.ollamaPostProcessingPrompt
+            )
             do {
                 processedText = try await OllamaPostProcessingService.process(
                     text: finalText,
                     baseURL: settings.ollamaBaseURL,
                     model: settings.ollamaModel,
                     reasoning: settings.ollamaReasoningSetting,
-                    prompt: settings.ollamaPostProcessingPrompt,
+                    prompt: prompt,
                     vocabulary: settings.customVocabulary
                 )
             } catch {
                 logger.error("postProcessing: Ollama failed: \(error.localizedDescription, privacy: .public)")
             }
         case .openRouter:
+            let prompt = AppPromptResolver.resolve(
+                bundleIdentifier: insertionTargetApp?.bundleIdentifier,
+                mappings: settings.appPromptMappings,
+                enabled: settings.appPromptMappingEnabled,
+                fallback: settings.openRouterPostProcessingPrompt
+            )
             do {
                 processedText = try await OpenRouterPostProcessingService.process(
                     text: finalText,
                     model: settings.openRouterModel,
-                    prompt: settings.openRouterPostProcessingPrompt,
+                    prompt: prompt,
                     vocabulary: settings.customVocabulary,
                     apiKey: settings.openRouterAPIKey,
                     apiKeyEnvironmentVariable: settings.openRouterAPIKeyEnvironmentVariable
@@ -758,13 +776,19 @@ final class AppState {
                 logger.error("postProcessing: OpenRouter failed: \(error.localizedDescription, privacy: .public)")
             }
         case .openAICompatible:
+            let prompt = AppPromptResolver.resolve(
+                bundleIdentifier: insertionTargetApp?.bundleIdentifier,
+                mappings: settings.appPromptMappings,
+                enabled: settings.appPromptMappingEnabled,
+                fallback: settings.openAICompatiblePostProcessingPrompt
+            )
             do {
                 processedText = try await OpenAICompatiblePostProcessingService.process(
                     text: finalText,
                     baseURL: settings.openAICompatibleBaseURL,
                     model: settings.openAICompatibleModel,
                     apiKey: settings.openAICompatibleAPIKey,
-                    prompt: settings.openAICompatiblePostProcessingPrompt,
+                    prompt: prompt,
                     vocabulary: settings.customVocabulary
                 )
             } catch {
