@@ -102,6 +102,11 @@ struct AIPostProcessingView: View {
             case .openAICompatible:
                 openAICompatibleContent(settings: settings)
             }
+
+            if settings.transcriptPostProcessingMode != .none,
+               settings.transcriptPostProcessingMode != .fluidAudioVocabulary {
+                AppPromptSettingsSection()
+            }
         }
         .task(id: providerTaskID(settings: settings)) {
             guard shouldAutoRefreshProviderAvailability else { return }
