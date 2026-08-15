@@ -16,6 +16,7 @@ struct AppPromptSettingsSection: View {
 
     var body: some View {
         @Bindable var settings = appState.settings
+        let runningApps = Self.runningApps()
 
         VStack(alignment: .leading, spacing: DS.Spacing.section) {
             DSSection(overline: "App Prompts") {
@@ -29,7 +30,7 @@ struct AppPromptSettingsSection: View {
                         DSDivider()
                         AppPromptMappingRow(
                             mapping: mapping,
-                            runningApps: Self.runningApps(),
+                            runningApps: runningApps,
                             takenBundleIdentifiers: Set(
                                 settings.appPromptMappings
                                     .filter { $0.id != mapping.id }
@@ -40,21 +41,21 @@ struct AppPromptSettingsSection: View {
                 }
             }
 
-            if settings.appPromptMappingEnabled, canAddMapping {
-                DSAddButton(title: "Add App") { addMapping() }
+            if settings.appPromptMappingEnabled, canAddMapping(runningApps: runningApps) {
+                DSAddButton(title: "Add App") { addMapping(runningApps: runningApps) }
             }
         }
     }
 
-    private var canAddMapping: Bool {
+    private func canAddMapping(runningApps: [RunningAppInfo]) -> Bool {
         let taken = Set(appState.settings.appPromptMappings.map(\.bundleIdentifier))
-        return Self.runningApps().contains { !taken.contains($0.bundleIdentifier) }
+        return runningApps.contains { !taken.contains($0.bundleIdentifier) }
     }
 
-    private func addMapping() {
+    private func addMapping(runningApps: [RunningAppInfo]) {
         let settings = appState.settings
         let taken = Set(settings.appPromptMappings.map(\.bundleIdentifier))
-        guard let app = Self.runningApps().first(where: { !taken.contains($0.bundleIdentifier) }) else { return }
+        guard let app = runningApps.first(where: { !taken.contains($0.bundleIdentifier) }) else { return }
         settings.addAppPromptMapping(bundleIdentifier: app.bundleIdentifier, appName: app.localizedName)
     }
 
@@ -111,7 +112,6 @@ private struct AppPromptMappingRow: View {
                     placeholder: "Enter a prompt for this app…",
                     minHeight: 60
                 )
-                .labelsHidden()
             }
         }
     }
