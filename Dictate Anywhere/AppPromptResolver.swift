@@ -17,7 +17,8 @@ enum AppPromptResolver {
         fallback: String
     ) -> String {
         guard enabled, let bundleIdentifier,
-              let match = mappings.first(where: { $0.bundleIdentifier == bundleIdentifier })
+              let match = mappings.first(where: { $0.bundleIdentifier == bundleIdentifier }),
+              !match.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return fallback }
         return match.prompt
     }

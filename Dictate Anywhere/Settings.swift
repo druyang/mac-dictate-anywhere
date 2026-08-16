@@ -866,6 +866,19 @@ final class Settings {
         return (try? JSONDecoder().decode([AppPromptMapping].self, from: data)) ?? []
     }
 
+    /// Master-toggle default for app prompts: `true` only on a genuinely
+    /// fresh install. `storedValue` (an explicit user choice, or a value
+    /// already persisted by a prior run of this same feature) always wins;
+    /// `isExistingInstall` only decides the default when nothing has ever
+    /// been stored, so upgrading users don't have preloaded per-app rules
+    /// silently activated over a global prompt they've already tuned.
+    nonisolated static func resolvedAppPromptMappingEnabled(
+        storedValue: Bool?,
+        isExistingInstall: Bool
+    ) -> Bool {
+        storedValue ?? !isExistingInstall
+    }
+
     var appPromptMappings: [AppPromptMapping] {
         didSet {
             guard let data = try? JSONEncoder().encode(appPromptMappings) else { return }
@@ -1195,7 +1208,18 @@ final class Settings {
 
         // App prompts
         appPromptMappings = Self.resolvedAppPromptMappings(from: defaults.data(forKey: Keys.appPromptMappings))
-        appPromptMappingEnabled = defaults.object(forKey: Keys.appPromptMappingEnabled) as? Bool ?? true
+        // Keys.transcriptPostProcessingMode is unconditionally persisted by the end of
+        // every completed Settings.init() (see the "Transcript Post Processing" block
+        // below, which writes it whenever it's absent). Since this check runs earlier
+        // in the same init(), it reflects state from *before* that write, so it reads
+        // nil only on a process's first-ever init — i.e. a genuinely fresh install —
+        // and non-nil on every later launch, including the first launch of this
+        // feature for anyone who ran a prior version of the app before.
+        let isExistingInstall = defaults.object(forKey: Keys.transcriptPostProcessingMode) != nil
+        appPromptMappingEnabled = Self.resolvedAppPromptMappingEnabled(
+            storedValue: defaults.object(forKey: Keys.appPromptMappingEnabled) as? Bool,
+            isExistingInstall: isExistingInstall
+        )
 
         // Filler words
         isFillerWordRemovalEnabled = defaults.object(forKey: Keys.isFillerWordRemovalEnabled) as? Bool ?? false

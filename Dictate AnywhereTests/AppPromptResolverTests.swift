@@ -59,4 +59,24 @@ final class AppPromptResolverTests: XCTestCase {
         )
         XCTAssertEqual(resolved, "Default prompt.")
     }
+
+    func testMatchWithEmptyPromptReturnsFallback() {
+        let resolved = AppPromptResolver.resolve(
+            bundleIdentifier: "com.apple.mail",
+            mappings: [mapping(prompt: "")],
+            enabled: true,
+            fallback: "Default prompt."
+        )
+        XCTAssertEqual(resolved, "Default prompt.")
+    }
+
+    func testMatchWithWhitespaceOnlyPromptReturnsFallback() {
+        let resolved = AppPromptResolver.resolve(
+            bundleIdentifier: "com.apple.mail",
+            mappings: [mapping(prompt: "   \n\t  ")],
+            enabled: true,
+            fallback: "Default prompt."
+        )
+        XCTAssertEqual(resolved, "Default prompt.")
+    }
 }

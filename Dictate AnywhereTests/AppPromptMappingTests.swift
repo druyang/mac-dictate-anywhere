@@ -47,6 +47,26 @@ final class AppPromptMappingTests: XCTestCase {
         XCTAssertEqual(ids.count, Set(ids).count)
     }
 
+    // MARK: - resolvedAppPromptMappingEnabled
+
+    func testResolvedMappingEnabledDefaultsTrueOnFreshInstall() {
+        XCTAssertTrue(Settings.resolvedAppPromptMappingEnabled(storedValue: nil, isExistingInstall: false))
+    }
+
+    func testResolvedMappingEnabledDefaultsFalseOnExistingInstall() {
+        XCTAssertFalse(Settings.resolvedAppPromptMappingEnabled(storedValue: nil, isExistingInstall: true))
+    }
+
+    func testResolvedMappingEnabledHonorsStoredTrueRegardlessOfInstallAge() {
+        XCTAssertTrue(Settings.resolvedAppPromptMappingEnabled(storedValue: true, isExistingInstall: true))
+        XCTAssertTrue(Settings.resolvedAppPromptMappingEnabled(storedValue: true, isExistingInstall: false))
+    }
+
+    func testResolvedMappingEnabledHonorsStoredFalseRegardlessOfInstallAge() {
+        XCTAssertFalse(Settings.resolvedAppPromptMappingEnabled(storedValue: false, isExistingInstall: true))
+        XCTAssertFalse(Settings.resolvedAppPromptMappingEnabled(storedValue: false, isExistingInstall: false))
+    }
+
     // MARK: - Settings persistence & CRUD
 
     private var savedAppPromptMappings: [AppPromptMapping] = []
