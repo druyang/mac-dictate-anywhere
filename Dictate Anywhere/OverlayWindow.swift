@@ -20,6 +20,14 @@ final class OverlayWindow {
     private let canvasWidth: CGFloat = OverlayMetrics.size(320)
     private let canvasHeight: CGFloat = OverlayMetrics.size(200)
 
+    @ObservationIgnored private let screenSession: OverlayScreenSession
+
+    // MARK: - Init
+
+    init(screenResolver: OverlayScreenResolving = SystemOverlayScreenResolver()) {
+        screenSession = OverlayScreenSession(resolver: screenResolver)
+    }
+
     // MARK: - Public
 
     func show(state: OverlayState) {
@@ -76,6 +84,9 @@ final class OverlayWindow {
     private func hideImpl() {
         model.isVisible = false
 
+        // The next appearance is a new session and picks its display afresh.
+        screenSession.end()
+
         // Allow fade-out animation to complete before removing window
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self else { return }
@@ -106,91 +117,18 @@ final class OverlayWindow {
     }
 
     private func positionWindow() {
-        guard let win = window else { return }
-
-        let screens = NSScreen.screens
-        guard let index = OverlayScreenPicker.pickScreenIndex(
-            screenFrames: screens.map(\.frame),
-            focusPoint: focusedElementLocation(),
-            mouseLocation: NSEvent.mouseLocation
-        ) else { return }
+        guard let win = window, let visibleFrame = screenSession.visibleFrame() else { return }
 
         let size = NSSize(width: canvasWidth, height: canvasHeight)
         let origin = OverlayScreenPicker.overlayOrigin(
-            inVisibleFrame: screens[index].visibleFrame,
+            inVisibleFrame: visibleFrame,
             size: size,
             bottomMargin: bottomMargin
         )
 
-        win.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
-    }
+        let frame = NSRect(origin: origin, size: size)
+        guard win.frame != frame else { return }
 
-    // MARK: - Focused element lookup
-
-    /// Global location of the control currently receiving keystrokes, so the
-    /// overlay lands on the display being dictated into. Nil when accessibility
-    /// is unavailable or the focused app reports no usable geometry.
-    private func focusedElementLocation() -> CGPoint? {
-        guard let primaryFrame = NSScreen.screens.first?.frame else { return nil }
-
-        let systemWide = AXUIElementCreateSystemWide()
-        // The overlay has to appear the instant the hotkey fires, so never let
-        // an unresponsive app block the main thread here.
-        AXUIElementSetMessagingTimeout(systemWide, 0.25)
-
-        var focusedElement: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            systemWide,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedElement
-        ) == .success,
-            let focusedElement,
-            CFGetTypeID(focusedElement) == AXUIElementGetTypeID() else {
-            return nil
-        }
-
-        let element = focusedElement as! AXUIElement
-        guard let axPoint = position(of: element) ?? containingWindowPosition(of: element) else {
-            return nil
-        }
-
-        return OverlayScreenPicker.appKitPoint(fromAccessibilityPoint: axPoint, primaryFrame: primaryFrame)
-    }
-
-    private func position(of element: AXUIElement) -> CGPoint? {
-        var positionValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            element,
-            kAXPositionAttribute as CFString,
-            &positionValue
-        ) == .success,
-            let positionValue,
-            CFGetTypeID(positionValue) == AXValueGetTypeID() else {
-            return nil
-        }
-
-        let axValue = positionValue as! AXValue
-        guard AXValueGetType(axValue) == .cgPoint else { return nil }
-
-        var point = CGPoint.zero
-        guard AXValueGetValue(axValue, .cgPoint, &point) else { return nil }
-        return point
-    }
-
-    /// Some apps expose no position on the focused element itself; its window
-    /// is a good enough stand-in for picking a display.
-    private func containingWindowPosition(of element: AXUIElement) -> CGPoint? {
-        var windowValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            element,
-            kAXWindowAttribute as CFString,
-            &windowValue
-        ) == .success,
-            let windowValue,
-            CFGetTypeID(windowValue) == AXUIElementGetTypeID() else {
-            return nil
-        }
-
-        return position(of: windowValue as! AXUIElement)
+        win.setFrame(frame, display: true, animate: false)
     }
 }
