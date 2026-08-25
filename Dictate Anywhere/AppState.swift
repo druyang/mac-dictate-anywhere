@@ -845,9 +845,11 @@ final class AppState {
         guard let frontmost = NSWorkspace.shared.frontmostApplication,
               frontmost.processIdentifier != currentPID else {
             insertionTargetApp = nil
+            overlay.beginSession(targetProcessIdentifier: nil)
             return
         }
         insertionTargetApp = frontmost
+        overlay.beginSession(targetProcessIdentifier: frontmost.processIdentifier)
     }
 
     private func reactivateInsertionTargetIfNeeded() async {

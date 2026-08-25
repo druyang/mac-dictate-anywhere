@@ -30,15 +30,34 @@ final class OverlayWindow {
 
     // MARK: - Public
 
-    func show(state: OverlayState) {
+    /// Starts a dictation, so the overlay chooses its display afresh.
+    ///
+    /// - Parameter targetProcessIdentifier: the app the transcript will be
+    ///   pasted into, captured before audio startup so the overlay follows it
+    ///   rather than whichever app is frontmost once the microphone is live.
+    func beginSession(targetProcessIdentifier: pid_t?) {
         hideTask?.cancel()
         hideTask = nil
 
         if Thread.isMainThread {
-            showImpl(state: state)
+            screenSession.begin(targetProcessIdentifier: targetProcessIdentifier)
         } else {
             DispatchQueue.main.async { [weak self] in
-                self?.showImpl(state: state)
+                self?.screenSession.begin(targetProcessIdentifier: targetProcessIdentifier)
+            }
+        }
+    }
+
+    func show(state: OverlayState) {
+        let supersedesFinishingSession = hideTask != nil
+        hideTask?.cancel()
+        hideTask = nil
+
+        if Thread.isMainThread {
+            showImpl(state: state, startsNewSession: supersedesFinishingSession)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.showImpl(state: state, startsNewSession: supersedesFinishingSession)
             }
         }
     }
@@ -53,6 +72,7 @@ final class OverlayWindow {
                 self?.hideImpl()
             }
         } else {
+            hideTask = nil
             if Thread.isMainThread {
                 hideImpl()
             } else {
@@ -65,7 +85,11 @@ final class OverlayWindow {
 
     // MARK: - Private
 
-    private func showImpl(state: OverlayState) {
+    private func showImpl(state: OverlayState, startsNewSession: Bool) {
+        if startsNewSession {
+            screenSession.end()
+        }
+
         if window == nil {
             window = createWindow()
             let content = OverlayContent(model: model)

@@ -3,26 +3,29 @@ import XCTest
 
 /// `OverlayWindow.show` runs on every overlay update, and `AppState` drives the
 /// listening waveform at roughly thirty updates a second. These tests pin the
-/// wiring between that redraw loop and the display lookup: one lookup while the
-/// overlay stays up, a fresh one after it hides.
+/// wiring between that redraw loop and the display lookup: one lookup while a
+/// dictation is up, and a fresh one for the next dictation — including when the
+/// next one starts before the previous overlay has finished hiding.
 @MainActor
 final class OverlayWindowScreenSessionTests: XCTestCase {
 
     /// Stands in for the window server and the accessibility API.
     private final class SpyResolver: OverlayScreenResolving {
-        var indexToResolve: Int? = 1
+        var displayIDToResolve: CGDirectDisplayID? = 2
         private(set) var resolveCount = 0
+        private(set) var requestedTargets: [pid_t?] = []
 
-        func visibleFrames() -> [CGRect] {
+        func displays() -> [OverlayDisplay] {
             [
-                CGRect(x: 0, y: 0, width: 1920, height: 1055),
-                CGRect(x: -1440, y: 0, width: 1440, height: 875),
+                OverlayDisplay(id: 1, visibleFrame: CGRect(x: 0, y: 0, width: 1512, height: 955)),
+                OverlayDisplay(id: 2, visibleFrame: CGRect(x: 1512, y: -458, width: 2560, height: 1410)),
             ]
         }
 
-        func resolveScreenIndex() -> Int? {
+        func resolveDisplayID(forApplication processIdentifier: pid_t?) -> CGDirectDisplayID? {
             resolveCount += 1
-            return indexToResolve
+            requestedTargets.append(processIdentifier)
+            return displayIDToResolve
         }
     }
 
@@ -71,6 +74,50 @@ final class OverlayWindowScreenSessionTests: XCTestCase {
         showListening(updates: 5)
 
         XCTAssertEqual(resolver.resolveCount, 2)
+    }
+
+    /// A finished dictation schedules a delayed hide and immediately goes idle.
+    /// Starting another dictation inside that delay cancels the hide, so the
+    /// display choice has to be reset by the new dictation rather than relying
+    /// on the hide that never fired.
+    func testASessionStartedBeforeTheDelayedHideFiresChoosesADisplayAgain() {
+        showListening(updates: 5)
+        overlay.hide(afterDelay: 5.0)
+        XCTAssertEqual(resolver.resolveCount, 1)
+
+        resolver.displayIDToResolve = 1
+        showListening(updates: 5)
+
+        XCTAssertEqual(resolver.resolveCount, 2, "the interrupted hide must not carry its display into the new dictation")
+    }
+
+    func testBeginningASessionBeforeTheDelayedHideFiresChoosesADisplayAgain() {
+        showListening(updates: 5)
+        overlay.hide(afterDelay: 5.0)
+
+        overlay.beginSession(targetProcessIdentifier: 4242)
+        showListening(updates: 5)
+
+        XCTAssertEqual(resolver.resolveCount, 2)
+    }
+
+    // MARK: - Following the app the text will land in
+
+    /// The insertion target is captured before audio startup; the overlay must
+    /// ask about that app, not whichever app is frontmost by the time the
+    /// microphone is live and the overlay finally appears.
+    func testResolvesAgainstTheCapturedInsertionTarget() {
+        overlay.beginSession(targetProcessIdentifier: 4242)
+
+        showListening(updates: 5)
+
+        XCTAssertEqual(resolver.requestedTargets, [4242])
+    }
+
+    func testFallsBackToTheFrontmostApplicationWithoutACapturedTarget() {
+        showListening(updates: 5)
+
+        XCTAssertEqual(resolver.requestedTargets, [nil])
     }
 
     func testEachDictationResolvesTheDisplayExactlyOnce() {

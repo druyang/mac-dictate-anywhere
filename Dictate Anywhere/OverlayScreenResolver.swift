@@ -12,15 +12,16 @@ import AppKit
 /// Split out of `OverlayWindow` so the once-per-session lookup can be tested
 /// without attaching monitors or granting accessibility permission.
 protocol OverlayScreenResolving {
-    /// Visible frames of the attached displays, primary first, in AppKit global
-    /// coordinates. Cheap enough to read on every overlay update.
-    func visibleFrames() -> [CGRect]
+    /// The attached displays, primary first, with visible frames in AppKit
+    /// global coordinates. Cheap enough to read on every overlay update.
+    func displays() -> [OverlayDisplay]
 
-    /// Index of the display the overlay belongs on, or nil when none matches.
+    /// Expensive: this is the call that crosses a process boundary to ask an
+    /// application where it is, so callers resolve once per dictation.
     ///
-    /// Expensive: this is the call that crosses a process boundary to ask the
-    /// focused application where it is, so callers resolve once per session.
-    func resolveScreenIndex() -> Int?
+    /// - Parameter processIdentifier: the app the transcript will be pasted
+    ///   into, or nil to follow whichever app is frontmost.
+    func resolveDisplayID(forApplication processIdentifier: pid_t?) -> CGDirectDisplayID?
 }
 
 /// Resolves the overlay's display from the real window server.
@@ -29,16 +30,24 @@ struct SystemOverlayScreenResolver: OverlayScreenResolving {
     /// unresponsive app must never block the main thread for long.
     private static let messagingTimeout: Float = 0.25
 
-    func visibleFrames() -> [CGRect] {
-        NSScreen.screens.map(\.visibleFrame)
+    func displays() -> [OverlayDisplay] {
+        NSScreen.screens.map {
+            OverlayDisplay(id: $0.displayID, visibleFrame: $0.visibleFrame)
+        }
     }
 
-    func resolveScreenIndex() -> Int? {
-        OverlayScreenPicker.pickScreenIndex(
-            screenFrames: NSScreen.screens.map(\.frame),
-            focusPoint: focusedLocation(),
+    func resolveDisplayID(forApplication processIdentifier: pid_t?) -> CGDirectDisplayID? {
+        let screens = NSScreen.screens
+
+        guard let index = OverlayScreenPicker.pickScreenIndex(
+            screenFrames: screens.map(\.frame),
+            focusPoint: focusedLocation(forApplication: processIdentifier),
             mouseLocation: NSEvent.mouseLocation
-        )
+        ) else {
+            return nil
+        }
+
+        return screens[index].displayID
     }
 
     // MARK: - Focus lookup
@@ -47,21 +56,21 @@ struct SystemOverlayScreenResolver: OverlayScreenResolving {
     /// lands on the display being dictated into. Nil when accessibility is
     /// unavailable or the focused app reports no usable geometry.
     ///
-    /// Everything here is asked of the frontmost application specifically.
-    /// The system-wide element's `kAXFocusedUIElement` looks like the obvious
-    /// way to do this and is not usable: it has been observed returning a stale
-    /// element belonging to a different process entirely — Terminal's text area
-    /// while Firefox was frontmost, on the opposite display — which would put
-    /// the overlay on a screen the dictated text is not going to. Dictation
-    /// pastes into the frontmost app, so the frontmost app is what to follow.
-    private func focusedLocation() -> CGPoint? {
+    /// Everything here is asked of one specific application. The system-wide
+    /// element's `kAXFocusedUIElement` looks like the obvious way to do this
+    /// and is not usable: it has been observed returning a stale element
+    /// belonging to a different process entirely — Terminal's text area while
+    /// Firefox was frontmost, on the opposite display — which would put the
+    /// overlay on a screen the dictated text is not going to.
+    private func focusedLocation(forApplication processIdentifier: pid_t?) -> CGPoint? {
         guard let primaryFrame = NSScreen.screens.first?.frame,
-              let app = NSWorkspace.shared.frontmostApplication else { return nil }
+              let targetPid = processIdentifier ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+        else { return nil }
 
         // The timeout has to be set on the system-wide element; that is what
         // makes it apply to this process's messages, including the ones below.
         let systemWide = AXUIElementCreateSystemWide()
-        let application = AXUIElementCreateApplication(app.processIdentifier)
+        let application = AXUIElementCreateApplication(targetPid)
 
         let axPoint = AccessibilityMessagingTimeout.withTimeout(
             Self.messagingTimeout,
@@ -143,5 +152,14 @@ struct SystemOverlayScreenResolver: OverlayScreenResolving {
         }
 
         return position(of: windowValue as! AXUIElement)
+    }
+}
+
+private extension NSScreen {
+    /// The display's `CGDirectDisplayID`, which stays with the physical display
+    /// across reconfiguration.
+    var displayID: CGDirectDisplayID {
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        return (deviceDescription[key] as? NSNumber)?.uint32Value ?? 0
     }
 }
