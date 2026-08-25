@@ -15,6 +15,34 @@ final class OverlayScreenPickerTests: XCTestCase {
     private var pointOnPrimary: CGPoint { CGPoint(x: 960, y: 540) }
     private var pointOnSecondary: CGPoint { CGPoint(x: -720, y: 450) }
 
+    // MARK: - A layout measured in the field
+
+    /// The desktop this bug was actually reproduced on: a 1512x982 built-in
+    /// display as primary, with a 2560x1440 ultrawide to its right whose
+    /// greater height puts its origin below the primary's. The accessibility
+    /// point is the real focused-window position VS Code reported while a text
+    /// box on the ultrawide had focus.
+    func testChoosesTheUltrawideForAWindowMeasuredOnIt() {
+        let builtIn = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let ultrawide = CGRect(x: 1512, y: -458, width: 2560, height: 1440)
+
+        let focusPoint = OverlayScreenPicker.appKitPoint(
+            fromAccessibilityPoint: CGPoint(x: 1512, y: 30),
+            primaryFrame: builtIn
+        )
+
+        XCTAssertEqual(focusPoint, CGPoint(x: 1512, y: 952))
+        XCTAssertEqual(
+            OverlayScreenPicker.pickScreenIndex(
+                screenFrames: [builtIn, ultrawide],
+                focusPoint: focusPoint,
+                mouseLocation: CGPoint(x: 466, y: 475)
+            ),
+            1,
+            "the overlay must follow the focused window, not the pointer on the built-in display"
+        )
+    }
+
     // MARK: - Screen selection
 
     func testPicksScreenContainingFocusedTextField() {

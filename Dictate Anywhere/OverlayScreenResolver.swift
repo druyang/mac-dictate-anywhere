@@ -36,27 +36,38 @@ struct SystemOverlayScreenResolver: OverlayScreenResolving {
     func resolveScreenIndex() -> Int? {
         OverlayScreenPicker.pickScreenIndex(
             screenFrames: NSScreen.screens.map(\.frame),
-            focusPoint: focusedElementLocation(),
+            focusPoint: focusedLocation(),
             mouseLocation: NSEvent.mouseLocation
         )
     }
 
-    // MARK: - Focused element lookup
+    // MARK: - Focus lookup
 
-    /// Global location of the control currently receiving keystrokes, so the
-    /// overlay lands on the display being dictated into. Nil when accessibility
-    /// is unavailable or the focused app reports no usable geometry.
-    private func focusedElementLocation() -> CGPoint? {
-        guard let primaryFrame = NSScreen.screens.first?.frame else { return nil }
+    /// Global location of whatever is receiving keystrokes, so the overlay
+    /// lands on the display being dictated into. Nil when accessibility is
+    /// unavailable or the focused app reports no usable geometry.
+    ///
+    /// Everything here is asked of the frontmost application specifically.
+    /// The system-wide element's `kAXFocusedUIElement` looks like the obvious
+    /// way to do this and is not usable: it has been observed returning a stale
+    /// element belonging to a different process entirely — Terminal's text area
+    /// while Firefox was frontmost, on the opposite display — which would put
+    /// the overlay on a screen the dictated text is not going to. Dictation
+    /// pastes into the frontmost app, so the frontmost app is what to follow.
+    private func focusedLocation() -> CGPoint? {
+        guard let primaryFrame = NSScreen.screens.first?.frame,
+              let app = NSWorkspace.shared.frontmostApplication else { return nil }
 
+        // The timeout has to be set on the system-wide element; that is what
+        // makes it apply to this process's messages, including the ones below.
         let systemWide = AXUIElementCreateSystemWide()
+        let application = AXUIElementCreateApplication(app.processIdentifier)
 
         let axPoint = AccessibilityMessagingTimeout.withTimeout(
             Self.messagingTimeout,
             apply: { _ = AXUIElementSetMessagingTimeout(systemWide, $0) }
         ) { () -> CGPoint? in
-            guard let element = focusedElement(of: systemWide) else { return nil }
-            return position(of: element) ?? containingWindowPosition(of: element)
+            focusedElementPosition(in: application) ?? focusedWindowPosition(in: application)
         }
 
         guard let axPoint else { return nil }
@@ -64,19 +75,37 @@ struct SystemOverlayScreenResolver: OverlayScreenResolving {
         return OverlayScreenPicker.appKitPoint(fromAccessibilityPoint: axPoint, primaryFrame: primaryFrame)
     }
 
-    private func focusedElement(of systemWide: AXUIElement) -> AXUIElement? {
-        var focusedElement: CFTypeRef?
+    /// Position of the control receiving keystrokes, for apps that expose one.
+    private func focusedElementPosition(in application: AXUIElement) -> CGPoint? {
+        guard let element = copyElement(kAXFocusedUIElementAttribute, from: application) else { return nil }
+        return position(of: element) ?? containingWindowPosition(of: element)
+    }
+
+    /// Position of the application's focused window.
+    ///
+    /// Chromium- and Gecko-based apps — VS Code, Slack, Firefox, Electron apps
+    /// generally — keep their accessibility tree switched off until they detect
+    /// a screen reader, so `kAXFocusedUIElement` answers `kAXErrorNoValue` for
+    /// them however it is asked. Their windows are ordinary windows and stay
+    /// visible to accessibility, and a window is enough to choose a display.
+    private func focusedWindowPosition(in application: AXUIElement) -> CGPoint? {
+        guard let window = copyElement(kAXFocusedWindowAttribute, from: application) else { return nil }
+        return position(of: window)
+    }
+
+    private func copyElement(_ attribute: String, from element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
-            systemWide,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedElement
+            element,
+            attribute as CFString,
+            &value
         ) == .success,
-            let focusedElement,
-            CFGetTypeID(focusedElement) == AXUIElementGetTypeID() else {
+            let value,
+            CFGetTypeID(value) == AXUIElementGetTypeID() else {
             return nil
         }
 
-        return (focusedElement as! AXUIElement)
+        return (value as! AXUIElement)
     }
 
     private func position(of element: AXUIElement) -> CGPoint? {
