@@ -101,6 +101,36 @@ final class OverlayWindowScreenSessionTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount, 2)
     }
 
+    // MARK: - Not leaving the previous dictation on screen
+
+    /// A finished dictation leaves its badge up for a second while the app goes
+    /// straight back to idle, so the next dictation routinely starts before the
+    /// hide fires. Cancelling that hide without dismissing anything would leave
+    /// the previous badge on the previous monitor for the whole of the next
+    /// dictation's startup — longer than if the hide had simply been left alone.
+    func testBeginningASessionDismissesThePreviousDictationsOverlay() {
+        showListening(updates: 3)
+        overlay.show(state: .success)
+        overlay.hide(afterDelay: 5.0)
+        XCTAssertTrue(overlay.isVisible, "precondition: the success badge is still up")
+
+        overlay.beginSession(targetProcessIdentifier: 4242)
+
+        XCTAssertFalse(overlay.isVisible, "the previous badge must not survive into the next dictation's startup")
+    }
+
+    /// The pending hide is what would otherwise reset the screen session, so
+    /// dismissing the old overlay must not take the new target with it.
+    func testDismissingThePreviousOverlayKeepsTheNewSessionsTarget() {
+        showListening(updates: 3)
+        overlay.hide(afterDelay: 5.0)
+
+        overlay.beginSession(targetProcessIdentifier: 4242)
+        showListening(updates: 3)
+
+        XCTAssertEqual(resolver.requestedTargets, [nil, 4242])
+    }
+
     // MARK: - Following the app the text will land in
 
     /// The insertion target is captured before audio startup; the overlay must

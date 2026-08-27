@@ -30,20 +30,30 @@ final class OverlayWindow {
 
     // MARK: - Public
 
+    /// Whether the overlay is currently presented.
+    var isVisible: Bool {
+        model.isVisible
+    }
+
     /// Starts a dictation, so the overlay chooses its display afresh.
     ///
     /// - Parameter targetProcessIdentifier: the app the transcript will be
     ///   pasted into, captured before audio startup so the overlay follows it
     ///   rather than whichever app is frontmost once the microphone is live.
     func beginSession(targetProcessIdentifier: pid_t?) {
+        // Cancelling the scheduled hide is what keeps it from resetting the
+        // session that is about to be pinned — but the previous dictation's
+        // badge is still on screen, and on the previous display. Dismiss it
+        // here rather than leaving it up for the whole of this dictation's
+        // startup, which is longer than the hide would have taken.
         hideTask?.cancel()
         hideTask = nil
 
         if Thread.isMainThread {
-            screenSession.begin(targetProcessIdentifier: targetProcessIdentifier)
+            beginSessionImpl(targetProcessIdentifier: targetProcessIdentifier)
         } else {
             DispatchQueue.main.async { [weak self] in
-                self?.screenSession.begin(targetProcessIdentifier: targetProcessIdentifier)
+                self?.beginSessionImpl(targetProcessIdentifier: targetProcessIdentifier)
             }
         }
     }
@@ -105,11 +115,23 @@ final class OverlayWindow {
         window?.orderFrontRegardless()
     }
 
+    private func beginSessionImpl(targetProcessIdentifier: pid_t?) {
+        dismissVisuals()
+        screenSession.begin(targetProcessIdentifier: targetProcessIdentifier)
+    }
+
     private func hideImpl() {
-        model.isVisible = false
+        dismissVisuals()
 
         // The next appearance is a new session and picks its display afresh.
         screenSession.end()
+    }
+
+    /// Takes the overlay off screen without touching the screen session, so
+    /// dismissing a finished dictation cannot clear the display a newly begun
+    /// one has already pinned.
+    private func dismissVisuals() {
+        model.isVisible = false
 
         // Allow fade-out animation to complete before removing window
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
