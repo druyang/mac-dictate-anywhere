@@ -61,6 +61,7 @@ final class AppState {
     let audioDeviceManager = AudioDeviceManager()
     let parakeetEngine = ParakeetEngine()
     let appleSpeechEngine = AppleSpeechEngine()
+    let s1MiniModelManager = S1MiniModelManager()
     let inputSourceMonitor = InputSourceMonitor()
     var appleSpeechSupportedLanguages: [SupportedLanguage] = []
     var appleSpeechInstalledLanguages: [SupportedLanguage] = []
@@ -173,6 +174,9 @@ final class AppState {
         guard !hasStarted else { return }
         hasStarted = true
 
+        Task { [weak self] in
+            await self?.s1MiniModelManager.refreshInstallationState()
+        }
         startupTask = Task { [weak self] in
             await self?.runStartupSequence()
         }
@@ -740,6 +744,29 @@ final class AppState {
             } else {
                 logger.info("postProcessing: Apple Intelligence skipped because prompt is empty")
             }
+        case .s1Mini:
+            let activeLanguage = settings.engineChoice == .appleSpeech
+                ? settings.appleSpeechLanguage
+                : settings.selectedLanguage
+            if activeLanguage != .english {
+                logger.warning(
+                    "postProcessing: S1-mini skipped because language is \(activeLanguage.rawValue, privacy: .public); S1-mini supports English only"
+                )
+            } else {
+                do {
+                    let modelURL = try await s1MiniModelManager.validatedModelURL()
+                    processedText = try await S1MiniPostProcessingService.process(
+                        text: finalText,
+                        modelURL: modelURL,
+                        styling: settings.s1MiniStyling,
+                        structure: settings.s1MiniStructure,
+                        contextSetting: settings.s1MiniContextSetting,
+                        context: postProcessingContext(includeCapturedText: false)
+                    )
+                } catch {
+                    logger.error("postProcessing: S1-mini failed: \(error.localizedDescription, privacy: .public)")
+                }
+            }
         case .ollama:
             do {
                 processedText = try await OllamaPostProcessingService.process(
@@ -883,10 +910,15 @@ final class AppState {
         // The overlay follows the app the transcript will land in. Everything
         // after this point is awaited — context capture here, then audio
         // startup — and the user may bring another app forward while it runs,
-        // so the display must be pinned to this app before any of it.
+        // so the display must be pinned to this app before any of it. It also
+        // has to be pinned ahead of the guard below, which returns early for
+        // most post-processing settings.
         overlay.beginSession(targetProcessIdentifier: frontmost.processIdentifier)
 
-        guard settings.dictationContextAwarenessEnabled else {
+        // Only read the screen when a cleanup method exists that can use what
+        // we read. `none` and FluidAudio Vocabulary never see the context.
+        guard settings.dictationContextAwarenessEnabled,
+              settings.transcriptPostProcessingMode.usesDictationContext else {
             sessionDictationContext = nil
             return
         }
